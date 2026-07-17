@@ -168,8 +168,25 @@ export function buildPdfDoc(JsPDF, data, employerInfo, employeeInfo, month, year
     return siret || '000 000 000 00000'
   }
 
-  // Format conventions
-  const formatConvText = (conv) => {
+  // Tronque une chaîne à la largeur dispo (mesure jsPDF avec la police courante).
+  const fitText = (str, maxW) => {
+    if (!str) return ''
+    if (doc.getTextWidth(str) <= maxW) return str
+    let s = str
+    while (s.length > 1 && doc.getTextWidth(s.trimEnd() + '…') > maxW) s = s.slice(0, -1)
+    return s.trimEnd() + '…'
+  }
+
+  // Mention obligatoire (R.3243-1) : intitulé + IDCC de la convention. Piloté par
+  // le libellé officiel figé dans la fiche employeur ; repli sur les anciens codes.
+  const formatConvText = (conv, maxW) => {
+    if (employerInfo.conventionName) {
+      const idcc = employerInfo.conventionIdcc || ''
+      // IDCC en tête (jamais tronqué : c'est la référence légale précise), puis le
+      // libellé officiel tronqué à la largeur dispo.
+      const prefix = idcc ? `IDCC ${idcc} — ` : ''
+      return prefix + fitText(employerInfo.conventionName, Math.max(10, maxW - doc.getTextWidth(prefix)))
+    }
     if (conv === 'IDCC1486' || conv === 'Syntec') return 'SYNTEC - 1486'
     if (conv === 'IDCC1979' || conv === 'HCR') return 'HCR - 1979'
     if (conv === 'IDCC2148') return 'TELECOMS - 2148'
@@ -231,7 +248,7 @@ export function buildPdfDoc(JsPDF, data, employerInfo, employeeInfo, month, year
   setColor(GRAY)
   doc.text(`SIRET : ${formatSIRET(employerInfo.siret)}`, margin, y + 14)
   doc.text(`Code APE : ${employerInfo.codeAPE || '0000Z'}`, margin, y + 17)
-  doc.text(`Convention : ${formatConvText(employerInfo.convention)}`, margin, y + 20)
+  doc.text(`Convention : ${formatConvText(employerInfo.convention, colW1 - 18)}`, margin, y + 20)
 
   // Col 2: Employee
   doc.setFontSize(8)
