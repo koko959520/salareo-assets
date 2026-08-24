@@ -53,6 +53,15 @@ function formatDateFR(value) {
  * @returns instance jsPDF (non sauvegardée)
  */
 export function buildPdfDoc(JsPDF, data, employerInfo, employeeInfo, month, year, template = 'classic', options = {}) {
+  // Le modèle « traditionnel » ne partage AUCUNE géométrie avec les trois autres
+  // (monospace, 5 colonnes propres, rubriques en capitales, pagination à en-tête
+  // répété). Il est donc rendu par une fonction dédiée plutôt qu'en ajoutant une
+  // palette ici : aucune régression possible sur classic/modern/minimalist, et le
+  // moteur « une page garantie » ci-dessous ne s'applique pas à lui.
+  if (template === 'traditionnel') {
+    return buildTraditionnelDoc(JsPDF, data, employerInfo, employeeInfo, month, year, options)
+  }
+
   const doc = new JsPDF('p', 'mm', 'a4')
   const pageW = 210
   const margin = 10
@@ -897,4 +906,372 @@ export function buildPdfDoc(JsPDF, data, employerInfo, employeeInfo, month, year
   }
 
   return doc
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// MODÈLE « TRADITIONNEL » — rendu monospace type éditeur SIRH (SAP / Sage / ADP)
+//
+// Géométrie relevée au point sur un bulletin A4 de référence (595 × 842 pt) puis
+// convertie en millimètres (unité du document jsPDF). Signature visuelle :
+//   • corps intégralement en Courier (police standard jsPDF, rien à embarquer) ;
+//   • 5 colonnes propres, en-tête sur bandeau bleu ciel, texte blanc ;
+//   • rubriques de cotisation en CAPITALES, sans encadré ;
+//   • signe négatif SUFFIXÉ (« 63,06- »), convention des éditeurs de paie ;
+//   • pagination à en-tête intégralement répété, totaux sur la DERNIÈRE page
+//     seulement (les cases restent dessinées mais vides sur les précédentes) ;
+//   • aucun logo — le bloc employeur est entièrement textuel.
+//
+// Les libellés sans équivalent dans Salareo (codes de rubrique propres à chaque
+// SIRH, filière, affectation, structure) sont volontairement laissés VIDES
+// plutôt que remplis avec une valeur plausible : la mise en page est reproduite,
+// jamais les données.
+// ═════════════════════════════════════════════════════════════════════════════
+
+/** Palette relevée dans le PDF de référence (opérateurs `rg`). */
+const TRAD_NAVY = [0, 32, 96]      // #002060 — titres
+const TRAD_BLUE = [0, 87, 161]     // #0057A1 — libellés de bandeau, mention de pied
+const TRAD_SKY = [117, 196, 255]   // #75C4FF — fonds de bandeau
+const TRAD_RULE = [150, 190, 225]  // filets du tableau
+
+/** Géométrie (mm). Les `R*` sont des bords DROITS d'alignement des nombres. */
+const T = {
+  X0: 6.35, X1: 203.55,
+  C1: 93.85, C2: 116.77, C3: 139.70, C4: 172.16,   // bordures internes
+  R1: 114.9, R2: 137.9, R3: 170.4, R4: 201.5,      // alignements droite
+  CODE_R: 21.0, LABEL_X: 29.1, CAT_X: 12.8, SUB_X: 30.6, PERIOD_X: 76.0,
+  EMP_X: 120.0,                                     // bloc salarié (droite)
+  LBL_COL: 34.6, VAL_COL: 36.6,                     // « LABEL  : valeur »
+  BAND_TOP: 95.6, BAND_H: 4.2, HEAD_BASE: 98.6,
+  BODY_TOP: 103.3, BODY_BOTTOM: 228.0, LINE_H: 2.84,
+  NET_Y: 232.0, IR_TOP: 240.0, NETBOX_TOP: 252.0,
+  RECAP_TOP: 263.5, ROW_H: 6.0,
+  FOOT_Y: 285.8, CODE_Y: 291.0,
+}
+
+/**
+ * Protection anti-crash : jsPDF lève sur un texte OU une coordonnée
+ * null/undefined/NaN. `buildPdfDoc` applique ce correctif à son propre document ;
+ * ce rendu n'empruntant pas son corps, il doit le réappliquer au sien.
+ */
+function patchTradText(doc) {
+  const raw = doc.text.bind(doc)
+  doc.text = (text, x, y, opts) => {
+    const clean = (t) => (t == null || (typeof t === 'number' && Number.isNaN(t))) ? '' : String(t)
+    const safe = Array.isArray(text) ? text.map(clean) : clean(text)
+    const sx = (typeof x !== 'number' || Number.isNaN(x)) ? 0 : x
+    const sy = (typeof y !== 'number' || Number.isNaN(y)) ? 0 : y
+    return opts ? raw(safe, sx, sy, opts) : raw(safe, sx, sy)
+  }
+}
+
+/** Montant au format SIRH : signe négatif SUFFIXÉ. Chaîne vide si nul/absent. */
+function fmtTrad(value, keepZero = false) {
+  const n = parseFloat(value)
+  if (!Number.isFinite(n) || (!keepZero && n === 0)) return ''
+  return formatMontant(Math.abs(n)) + (n < 0 ? '-' : '')
+}
+
+function buildTraditionnelDoc(JsPDF, data, employerInfo, employeeInfo, month, year, options = {}) {
+  const doc = new JsPDF('p', 'mm', 'a4')
+  patchTradText(doc)
+
+  const emp = employerInfo || {}
+  const sal = employeeInfo || {}
+  const lastDay = new Date(year, month + 1, 0).getDate()
+  const mm2 = String(month + 1).padStart(2, '0')
+  const periodStart = data.proration?.periodeDebut || `01/${mm2}/${year}`
+  const periodEnd = data.proration?.periodeFin || `${lastDay}/${mm2}/${year}`
+  const shortPeriod = `${mm2}/${String(year).slice(2)}`
+
+  // ── Primitives ────────────────────────────────────────────────────────────
+  const mono = (size = 7, style = 'normal') => { doc.setFont('courier', style); doc.setFontSize(size) }
+  const sans = (size = 7, style = 'normal') => { doc.setFont('helvetica', style); doc.setFontSize(size) }
+  const ink = (c) => doc.setTextColor(c[0], c[1], c[2])
+  const fill = (x, y, w, h, c) => { doc.setFillColor(c[0], c[1], c[2]); doc.rect(x, y, w, h, 'F') }
+  const stroke = (x, y, w, h, c = TRAD_RULE, lw = 0.2) => {
+    doc.setDrawColor(c[0], c[1], c[2]); doc.setLineWidth(lw); doc.rect(x, y, w, h, 'S')
+  }
+  const rule = (x1, y1, x2, y2, c = TRAD_RULE, lw = 0.2) => {
+    doc.setDrawColor(c[0], c[1], c[2]); doc.setLineWidth(lw); doc.line(x1, y1, x2, y2)
+  }
+  const right = (txt, x, y) => { const s = txt == null ? '' : String(txt); doc.text(s, x - doc.getTextWidth(s), y) }
+  const center = (txt, x, y) => { const s = txt == null ? '' : String(txt); doc.text(s, x - doc.getTextWidth(s) / 2, y) }
+  /** Tronque à une largeur mm donnée (Courier : avance fixe = 0.6 × corps). */
+  const clip = (str, maxMm, size = 7) => {
+    const per = size * 0.6 * 0.352778
+    const max = Math.max(1, Math.floor(maxMm / per))
+    const s = String(str || '')
+    return s.length <= max ? s : s.slice(0, max - 1) + '.'
+  }
+  /** « LABEL            : valeur » — deux-points alignés comme sur l'original. */
+  const kv = (label, value, y, x = 8) => {
+    mono(7); ink([0, 0, 0])
+    doc.text(String(label || ''), x, y)
+    doc.text(':', T.LBL_COL, y)
+    doc.text(String(value == null ? '' : value), T.VAL_COL, y)
+  }
+
+  // ── Lignes du corps ───────────────────────────────────────────────────────
+  // kind: 'item' (élément chiffré) | 'cat' (rubrique) | 'gap' | 'rule'
+  const rows = []
+  const item = (o) => rows.push({ kind: 'item', ...o })
+  const gap = () => rows.push({ kind: 'gap' })
+
+  item({ label: 'Rémunération de base', period: shortPeriod, base: data.horaireMensuel, taux: data.tauxHoraire, salAmt: data.salaireBase })
+
+  if (data.heuresSuppLignes && data.heuresSuppLignes.length > 0) {
+    data.heuresSuppLignes.forEach((l) => {
+      if ((l.heures || 0) > 0) {
+        item({ label: l.label || `Heures supp. ${l.tauxMult}%`, base: l.heures, taux: l.computedTauxHS, salAmt: l.brut })
+      }
+    })
+  } else if (data.heuresSupp > 0) {
+    item({ label: 'Heures supplémentaires', base: data.heuresSupp, taux: data.tauxHS, salAmt: data.hsBrut })
+  }
+
+  if (data.primes && data.primes.length > 0) {
+    data.primes.forEach((p) => { if ((p.montant || 0) > 0) item({ label: p.label || 'Prime', salAmt: p.montant }) })
+  } else if (data.primeExceptionnelle > 0) {
+    item({ label: 'Prime exceptionnelle', salAmt: data.primeExceptionnelle })
+  }
+
+  item({ label: 'Total Brut', salAmt: data.totalBrut, bold: true })
+  gap()
+
+  let cat = null
+  ;(data.cotisations || []).forEach((c) => {
+    if (c.category !== cat) { cat = c.category; rows.push({ kind: 'cat', label: c.category }) }
+    item({
+      label: c.name, sub: true,
+      base: c.base, taux: c.tauxSal,
+      salAmt: c.partSal > 0 ? -c.partSal : 0,
+      patAmt: c.partPat > 0 ? -c.partPat : 0,
+    })
+  })
+
+  if ((data.totalAllegements || 0) > 0) {
+    gap()
+    item({ label: 'ALLEGEMENT DE COTISATIONS :', cap: true, patAmt: data.totalAllegements })
+  }
+
+  gap()
+  item({
+    label: 'TOTAL DES COTISATIONS ET CONTRIBUTIONS :', cap: true,
+    salAmt: -(data.totalCotisSal || 0), patAmt: -(data.totalCotisPat || 0),
+  })
+  gap()
+  item({ label: 'Montant net social', salAmt: data.netSocial })
+
+  // ── Tenue sur UNE page (exigence produit) ─────────────────────────────────
+  // Le bulletin de référence déborde sur une 2ᵉ page ; ici on garde une page
+  // unique en resserrant l'interligne, et le corps du texte avec lui pour que
+  // les glyphes ne se chevauchent jamais. Au-delà du plancher de lisibilité on
+  // ne descend plus (cas pathologique : le contenu déborderait alors du cadre,
+  // ce que les plafonds de saisie de l'UI — 8 HS / 8 primes — rendent
+  // inatteignable en pratique).
+  const AVAIL = T.BODY_BOTTOM - T.BODY_TOP
+  const lineH = rows.length > 0 ? Math.min(T.LINE_H, AVAIL / rows.length) : T.LINE_H
+  const bodySize = Math.max(4.6, Math.min(7, (lineH / T.LINE_H) * 7))
+
+  // ── En-tête (répété intégralement sur chaque page) ─────────────────────────
+  function drawHeader() {
+    sans(11, 'bold'); ink(TRAD_NAVY)
+    right('BULLETIN DE PAIE', 197.8, 9.9)
+
+    mono(7); ink([0, 0, 0])
+    doc.text(clip(emp.nom || '', 60), 32.3, 26.7)
+    const adr = [emp.adresse, [emp.codePostal, emp.ville].filter(Boolean).join(' ')].filter(Boolean).join(' ')
+    doc.text(clip(`SIEGE SOCIAL : ${adr}`, 130), T.X0, 29.5)
+    doc.text('-'.repeat(59), T.X0, 32.1)
+
+    // Convention collective (gauche) + identité du salarié (droite)
+    const ccn = emp.conventionName || emp.convention || ''
+    if (ccn) doc.text(clip(`CCN  ${ccn}`, 100), T.X0, 46.5)
+
+    const civil = sal.sexe === 'F' ? 'Mme' : sal.sexe === 'M' ? 'M.' : ''
+    doc.text(clip([civil, sal.prenom, (sal.nom || '').toUpperCase()].filter(Boolean).join(' '), 78), T.EMP_X, 43.7)
+    doc.text(clip(sal.adresse || '', 78), T.EMP_X, 46.5)
+    doc.text(clip([sal.codePostal, sal.ville].filter(Boolean).join(' '), 78), T.EMP_X, 51.9)
+
+    // Bloc caractéristiques — uniquement les champs réellement renseignés.
+    let yy = 55.1
+    const line = (l, v) => { if (v !== '' && v != null) { kv(l, v, yy); yy += 2.82 } }
+    line('MATRICULE', sal.matricule || '')
+    line('ANCIENNETE', formatDateFR(sal.dateEntree))
+    if (sal.niveau || sal.coefficient) line('NIVEAU /COEFF.', [sal.niveau, sal.coefficient].filter(Boolean).join('   '))
+    line('QUALIFICATION', sal.statut || '')
+    line('EMPLOI', sal.emploi || '')
+    if (sal.echelon) line('ECHELON', sal.echelon)
+    line('HORAIRE', `${formatMontant(data.horaireMensuel)} Heures`)
+
+    kv('N° S.S.', sal.numSecu || '', 83.3)
+
+    mono(7)
+    const siret = formatSiretTrad(emp.siret)
+    doc.text(clip(`SIRET : ${siret}    NAF : ${emp.codeAPE || ''}`, 110), T.X0, 92.0)
+    doc.text(`PERIODE ${periodStart} ${periodEnd}`, 140.0, 88.9)
+    doc.text(`DATE DE PAIE : ${periodEnd}`, 140.0, 92.0)
+
+    // Bandeau des colonnes
+    fill(T.X0, T.BAND_TOP, T.X1 - T.X0, T.BAND_H, TRAD_SKY)
+    sans(5.6, 'bold'); ink([255, 255, 255])
+    center('ELEMENTS DE PAIE', (T.X0 + T.C1) / 2, T.HEAD_BASE)
+    center('NBRE OU BASE', (T.C1 + T.C2) / 2, T.HEAD_BASE)
+    center('TAUX SALARIAL', (T.C2 + T.C3) / 2, T.HEAD_BASE)
+    center('PART SALARIALE', (T.C3 + T.C4) / 2, T.HEAD_BASE)
+    center('PART EMPLOYEUR', (T.C4 + T.X1) / 2, T.HEAD_BASE)
+
+    // Cadre + séparateurs verticaux, jusqu'au bas de la zone de saisie
+    stroke(T.X0, T.BAND_TOP, T.X1 - T.X0, T.BODY_BOTTOM - T.BAND_TOP)
+    ;[T.C1, T.C2, T.C3, T.C4].forEach((x) => rule(x, T.BAND_TOP, x, T.BODY_BOTTOM))
+
+    // Mention verticale en marge droite (comme sur l'original)
+    sans(6.4); ink(TRAD_NAVY)
+    doc.text('Pour faire valoir vos droits, conservez ce document sans limitation de durée',
+      T.X1 + 4.2, T.BODY_BOTTOM - 2, { angle: 90 })
+  }
+
+  // ── Corps ─────────────────────────────────────────────────────────────────
+  function drawBody() {
+    let yy = T.BODY_TOP
+    rows.forEach((r) => {
+      if (r.kind === 'gap') { yy += lineH; return }
+      if (r.kind === 'cat') {
+        mono(bodySize); ink([0, 0, 0])
+        doc.text(clip(String(r.label || '').toUpperCase(), 78, bodySize), T.CAT_X, yy)
+        yy += lineH
+        return
+      }
+      mono(bodySize, r.bold ? 'bold' : 'normal'); ink([0, 0, 0])
+      if (r.code) right(String(r.code), T.CODE_R, yy)
+      const x = r.cap ? T.CAT_X : (r.sub ? T.SUB_X : T.LABEL_X)
+      doc.text(clip(r.label, T.C1 - x - 2, bodySize), x, yy)
+      if (r.period) doc.text(r.period, T.PERIOD_X, yy)
+      right(fmtTrad(r.base), T.R1, yy)
+      right(formatTaux(r.taux), T.R2, yy)
+      right(fmtTrad(r.salAmt), T.R3, yy)
+      right(fmtTrad(r.patAmt), T.R4, yy)
+      yy += lineH
+    })
+  }
+
+  // ── Pied : totaux, impôt, net, récapitulatif ──────────────────────────────
+  function drawFooter(filled) {
+    // NET À PAYER AVANT IMPÔT
+    sans(8, 'bold'); ink(TRAD_NAVY)
+    doc.text('NET A PAYER AVANT IMPOT SUR LE REVENU', T.X0, T.NET_Y)
+    if (filled) { mono(7.6, 'bold'); ink([0, 0, 0]); right(fmtTrad(data.netAvantIR, true), T.R3, T.NET_Y) }
+
+    // Mention réglementaire (bandeau bleu clair)
+    fill(T.X0, T.NET_Y + 1.8, T.X1 - T.X0, 3.6, TRAD_SKY)
+    stroke(T.X0, T.NET_Y + 1.8, T.X1 - T.X0, 3.6)
+    ;[T.C1, T.C2, T.C3, T.C4].forEach((x) => rule(x, T.NET_Y + 1.8, x, T.NET_Y + 5.4))
+    sans(4.6, 'bold'); ink(TRAD_NAVY)
+    doc.text("Dont évolution de la rémunération liée à la suppression des cotisations chômage et maladie", T.X0 + 1, T.NET_Y + 4.3)
+
+    // Bloc impôt sur le revenu — bandeau bleu sur « libellé + Base » et sur
+    // « Montant », zone blanche au milieu (emplacement du taux personnalisé).
+    const irH = 4.6
+    fill(T.X0, T.IR_TOP, T.C2 - T.X0, irH, TRAD_SKY)
+    fill(T.C4, T.IR_TOP, T.X1 - T.C4, irH, TRAD_SKY)
+    sans(5.2, 'bold'); ink(TRAD_NAVY)
+    doc.text('IMPOT SUR LE REVENU', T.X0 + 1, T.IR_TOP + 3.1)
+    center('Base', (T.C1 + T.C2) / 2, T.IR_TOP + 3.1)
+    center('Montant', (T.C4 + T.X1) / 2, T.IR_TOP + 3.1)
+    stroke(T.X0, T.IR_TOP, T.X1 - T.X0, irH * 2)
+    rule(T.X0, T.IR_TOP + irH, T.X1, T.IR_TOP + irH)
+    ;[T.C1, T.C2, T.C4].forEach((x) => rule(x, T.IR_TOP, x, T.IR_TOP + irH * 2))
+    sans(5.2, 'bold'); ink(TRAD_NAVY)
+    doc.text('IMPOT SUR LE REVENU PRELEVE A LA SOURCE', T.X0 + 1, T.IR_TOP + irH + 3.1)
+    if (filled) {
+      mono(7); ink([0, 0, 0])
+      right(fmtTrad(data.baseIR, true), T.C2 - 2, T.IR_TOP + irH + 3.1)
+      const tx = formatTaux(data.tauxIR)
+      sans(7); ink(TRAD_NAVY)
+      center(tx ? 'TAUX PERSONNALISE' : 'TAUX NON PERSONNALISE', (T.C2 + T.C4) / 2, T.IR_TOP + 3.1)
+      mono(7); ink([0, 0, 0])
+      right(tx ? `${tx} %` : formatTaux(0) || '0,00', T.C4 - 2, T.IR_TOP + irH + 3.1)
+      right(fmtTrad(data.irPreleve, true), T.R4, T.IR_TOP + irH + 3.1)
+      // Mode de règlement, sous le bloc — comme sur le bulletin de référence.
+      const mode = data.modePaiement || emp.modePaiement || 'VIREMENT'
+      mono(7); ink([0, 0, 0])
+      doc.text(`MODE DE REGLEMENT : ${String(mode).toUpperCase()}`, T.X0, T.IR_TOP + irH * 2 + 3.4)
+    }
+
+    // Encadré NET À PAYER EN EUROS
+    const boxY = T.NETBOX_TOP, boxH = 7.4
+    fill(T.C1 + 8, boxY, 56, boxH, TRAD_SKY)
+    doc.setDrawColor(TRAD_NAVY[0], TRAD_NAVY[1], TRAD_NAVY[2]); doc.setLineWidth(0.5)
+    doc.rect(T.C1 + 8, boxY, 56, boxH, 'S')
+    doc.rect(T.C4 - 6.5, boxY, 40, boxH, 'S')
+    sans(7.4, 'bold'); ink(TRAD_NAVY)
+    center('NET A PAYER EN EUROS', T.C1 + 36, boxY + 4.9)
+    if (filled) { mono(9, 'bold'); ink([0, 0, 0]); right(formatMontant(data.netAPayer), T.C4 + 28, boxY + 5.1) }
+    sans(6, 'bold'); ink(TRAD_NAVY)
+    doc.text('€', T.C4 + 29.5, boxY + 3.4)
+
+    // Récapitulatif MOIS / CUMUL
+    const cw = [0, 26.5, 26.5, 26.5, 26.5, 26.5, 27.5, 27.5]
+    const xs = [T.X0 + 16]
+    for (let i = 1; i < cw.length; i++) xs.push(xs[i - 1] + cw[i])
+    const heads = ['BRUT', 'COTISATIONS\nSALARIALES', 'COTISATIONS\nPATRONALES', 'NET IMPOSABLE',
+      'BRUT CONGES PAYES', 'Allègements cotisations\nemployeur', 'Total versé par l\'employeur']
+    const hH = 5.6
+    fill(xs[0], T.RECAP_TOP, xs[7] - xs[0], hH, TRAD_SKY)
+    sans(4.5, 'bold'); ink(TRAD_NAVY)
+    heads.forEach((h, i) => {
+      const parts = String(h).split('\n')
+      parts.forEach((p, k) => center(p, (xs[i] + xs[i + 1]) / 2, T.RECAP_TOP + (parts.length === 1 ? 3.6 : 2.4 + k * 2.1)))
+    })
+    const r1y = T.RECAP_TOP + hH, r2y = r1y + 5.4
+    fill(T.X0, r1y, 16, 5.4, TRAD_SKY); fill(T.X0, r2y, 16, 5.4, TRAD_SKY)
+    sans(5, 'bold'); ink(TRAD_NAVY)
+    doc.text('MOIS', T.X0 + 1.5, r1y + 3.6)
+    doc.text('CUMUL', T.X0 + 1.5, r2y + 3.6)
+    stroke(T.X0, T.RECAP_TOP, xs[7] - T.X0, hH + 10.8)
+    rule(T.X0, r1y, xs[7], r1y); rule(T.X0, r2y, xs[7], r2y)
+    rule(T.X0 + 16, T.RECAP_TOP, T.X0 + 16, r2y + 5.4)
+    xs.slice(1, 7).forEach((x) => rule(x, T.RECAP_TOP, x, r2y + 5.4))
+
+    if (filled) {
+      const cum = data.cumuls || {}
+      mono(6.4); ink([0, 0, 0])
+      const mois = [data.totalBrut, data.totalCotisSal, data.totalCotisPat, data.baseIR, null, data.totalAllegements, data.totalVerseEmployeur]
+      const cumul = [cum.brut, cum.cotisSal, cum.cotisPat, cum.netImposable, null, cum.allegements, cum.totalVerse]
+      mois.forEach((v, i) => { if (v != null) right(fmtTrad(v, true), xs[i + 1] - 1.5, r1y + 3.7) })
+      cumul.forEach((v, i) => { if (v != null) right(fmtTrad(v, true), xs[i + 1] - 1.5, r2y + 3.7) })
+    }
+
+    // Pied de page
+    sans(5.6); ink(TRAD_BLUE)
+    center('Pour la définition des termes employés, se reporter au site internet www.service-public.fr rubrique cotisations sociales', 105, T.FOOT_Y)
+    mono(6); ink([0, 0, 0])
+    const ref = [sal.matricule || '', (sal.nom || '').toUpperCase(), sal.prenom || '', periodEnd].filter(Boolean).join('   ')
+    doc.text(clip(ref, 190, 6), T.X0, T.CODE_Y)
+  }
+
+  drawHeader()
+  drawBody()
+  drawFooter(true)
+
+  // Filigrane d'aperçu non payé — même dispositif que buildPdfDoc. Inopérant
+  // sous Deno (GState absent) : le serveur ré-appose son propre tampon.
+  if (options.watermark) {
+    const n = doc.getNumberOfPages()
+    for (let p = 1; p <= n; p++) {
+      doc.setPage(p)
+      try { doc.setGState(new doc.GState({ opacity: 0.13 })) } catch { /* Deno : ignoré */ }
+      doc.setTextColor(180, 40, 40); doc.setFont('helvetica', 'bold'); doc.setFontSize(30)
+      for (let k = 0; k < 5; k++) doc.text('SPÉCIMEN — NON PAYÉ', 22, 60 + k * 52, { angle: 33 })
+      try { doc.setGState(new doc.GState({ opacity: 1 })) } catch { /* Deno : ignoré */ }
+    }
+  }
+
+  return doc
+}
+
+/** SIRET « XXX XXX XXX XXXXX » — copie locale (celle de buildPdfDoc lui est interne). */
+function formatSiretTrad(siret) {
+  const d = String(siret || '').replace(/\s/g, '')
+  return d.length === 14 ? `${d.slice(0, 3)} ${d.slice(3, 6)} ${d.slice(6, 9)} ${d.slice(9)}` : (siret || '')
 }
