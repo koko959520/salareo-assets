@@ -937,13 +937,13 @@ const TRAD_RULE = [150, 190, 225]  // filets du tableau
 const T = {
   X0: 6.35, X1: 203.55,
   C1: 93.85, C2: 116.77, C3: 139.70, C4: 172.16,   // bordures internes
-  R1: 114.9, R2: 137.9, R3: 170.4, R4: 201.5,      // alignements droite
+  R1: 113.5, R2: 137.9, R3: 170.3, R4: 196.4,      // alignements droite (mesurés sur l'original ; R4 nettement en retrait du bord — marge de sécurité voulue par le gabarit source, PAS un oubli)
   CODE_R: 21.0, LABEL_X: 29.1, CAT_X: 12.8, SUB_X: 30.6, PERIOD_X: 76.0,
   EMP_X: 120.0,                                     // bloc salarié (droite)
   LBL_COL: 34.6, VAL_COL: 36.6,                     // « LABEL  : valeur »
   BAND_TOP: 95.6, BAND_H: 4.2, HEAD_BASE: 98.6,
   BODY_TOP: 103.3, BODY_BOTTOM: 228.0, LINE_H: 2.84,
-  NET_Y: 232.0, IR_TOP: 240.0, NETBOX_TOP: 252.0,
+  NET_Y: 232.0, IR_TOP: 242.0, NETBOX_TOP: 252.0,
   RECAP_TOP: 263.5, ROW_H: 6.0,
   FOOT_Y: 285.8, CODE_Y: 291.0,
 }
