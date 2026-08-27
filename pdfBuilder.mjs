@@ -1192,10 +1192,45 @@ function buildTraditionnelDoc(JsPDF, data, employerInfo, employeeInfo, month, ye
       mono(7); ink([0, 0, 0])
       right(tx ? `${tx} %` : formatTaux(0) || '0,00', T.C4 - 2, T.IR_TOP + irH + 3.1)
       right(fmtTrad(data.irPreleve, true), T.R4, T.IR_TOP + irH + 3.1)
-      // Mode de règlement, sous le bloc — comme sur le bulletin de référence.
+      // Compteurs de congés — bande libre à GAUCHE du bloc « NET A PAYER »
+      // (qui commence à T.C1+8). Le gabarit n'affichait aucun congé jusqu'ici :
+      // seule la colonne « BRUT CONGES PAYES » du récapitulatif existait, et
+      // elle reste vide (voir plus bas). Les soldes sont pourtant une mention
+      // attendue sur un bulletin — ajoutés le 26/08/2026.
+      const lv = data.leave
+      if (lv) {
+        const cy = T.IR_TOP + irH * 2 + 2.4      // sous le tableau impôt, avec de l'air
+        const LH = 2.1                            // 4 lignes -> 8.4 mm ; MODE DE REGLEMENT suit à RECAP_TOP-1.6
+        const cX = [T.X0, 44, 60, 78]             // libellé, acquis, pris, solde (alignés à droite)
+        sans(4.6, 'bold'); ink(TRAD_NAVY)
+        doc.text('CONGES PAYES ET RTT (en jours)', cX[0], cy)
+        right('ACQUIS', cX[1], cy); right('PRIS', cX[2], cy); right('SOLDE', cX[3], cy)
+        // « Pris » = cumul depuis le début de la période de référence, ventilé
+        // N-1 d'abord puis N — même règle que le moteur (calculations.js) et
+        // que l'autre modèle de bulletin, pour ne pas afficher deux vérités.
+        const prisN1 = Math.min(lv.cpN1Acquis, lv.cumulCongesPris)
+        const prisN = lv.cumulCongesPris > lv.cpN1Acquis ? lv.cumulCongesPris - lv.cpN1Acquis : 0
+        const lignes = [
+          ['CP N-1', lv.cpN1Acquis, prisN1, lv.cpN1Solde],
+          ['CP N', lv.cpNAcquis, prisN, lv.cpNSolde],
+          ['RTT', lv.rttAcquis, lv.cumulRttPris, lv.rttSolde],
+        ]
+        lignes.forEach((r, i) => {
+          const y = cy + LH * (i + 1)
+          mono(5); ink([0, 0, 0])
+          doc.text(String(r[0]), cX[0], y)
+          right(formatMontant(r[1]), cX[1], y)
+          right(formatMontant(r[2]), cX[2], y)
+          mono(5, 'bold')
+          right(formatMontant(r[3]), cX[3], y)
+        })
+      }
+
+      // Mode de règlement — descendu sous les compteurs de congés (il occupait
+      // auparavant l'emplacement que ceux-ci prennent désormais).
       const mode = data.modePaiement || emp.modePaiement || 'VIREMENT'
-      mono(7); ink([0, 0, 0])
-      doc.text(`MODE DE REGLEMENT : ${String(mode).toUpperCase()}`, T.X0, T.IR_TOP + irH * 2 + 3.4)
+      mono(6.4); ink([0, 0, 0])
+      doc.text(`MODE DE REGLEMENT : ${String(mode).toUpperCase()}`, T.X0, T.RECAP_TOP - 1.6)
     }
 
     // Encadré NET À PAYER EN EUROS
@@ -1236,6 +1271,11 @@ function buildTraditionnelDoc(JsPDF, data, employerInfo, employeeInfo, month, ye
     if (filled) {
       const cum = data.cumuls || {}
       mono(6.4); ink([0, 0, 0])
+      // Le `null` en 5e position = colonne « BRUT CONGES PAYES ». Elle reste
+      // VIDE à dessein : la rémunération est mensualisée (maintien de salaire
+      // pendant les congés), le moteur ne produit donc aucune indemnité de
+      // congés payés distincte à y reporter. Y écrire un montant reviendrait à
+      // inventer une donnée. Les compteurs en JOURS sont affichés plus haut.
       const mois = [data.totalBrut, data.totalCotisSal, data.totalCotisPat, data.baseIR, null, data.totalAllegements, data.totalVerseEmployeur]
       const cumul = [cum.brut, cum.cotisSal, cum.cotisPat, cum.netImposable, null, cum.allegements, cum.totalVerse]
       mois.forEach((v, i) => { if (v != null) right(fmtTrad(v, true), xs[i + 1] - 1.5, r1y + 3.7) })
