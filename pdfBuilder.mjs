@@ -248,12 +248,12 @@ export function buildPdfDoc(JsPDF, data, employerInfo, employeeInfo, month, year
   doc.setFontSize(8)
   doc.setFont('helvetica', 'bold')
   setColor(PRIMARY)
-  doc.text(employerInfo.nom || 'Nom Entreprise', margin, y + 3)
+  doc.text(fitText(employerInfo.nom || 'Nom Entreprise', colW1), margin, y + 3)
   doc.setFont('helvetica', 'normal')
   doc.setFontSize(6.5)
   setColor(BLACK)
-  doc.text(employerInfo.adresse || 'Adresse', margin, y + 7)
-  doc.text(`${employerInfo.codePostal || '75000'} ${employerInfo.ville || 'VILLE'}`, margin, y + 10)
+  doc.text(fitText(employerInfo.adresse || 'Adresse', colW1), margin, y + 7)
+  doc.text(fitText(`${employerInfo.codePostal || '75000'} ${employerInfo.ville || 'VILLE'}`, colW1), margin, y + 10)
   setColor(GRAY)
   doc.text(`SIRET : ${formatSIRET(employerInfo.siret)}`, margin, y + 14)
   doc.text(`Code APE : ${employerInfo.codeAPE || '0000Z'}`, margin, y + 17)
@@ -263,13 +263,13 @@ export function buildPdfDoc(JsPDF, data, employerInfo, employeeInfo, month, year
   doc.setFontSize(8)
   doc.setFont('helvetica', 'bold')
   setColor(PRIMARY)
-  doc.text(`${employeeInfo.prenom} ${employeeInfo.nom}`, margin + colW1 + 5, y + 3)
+  doc.text(fitText(`${employeeInfo.prenom} ${employeeInfo.nom}`, colW2 - 5), margin + colW1 + 5, y + 3)
   doc.setFont('helvetica', 'normal')
   doc.setFontSize(6.5)
   setColor(BLACK)
   // Adresse salariale (obligatoire sur le bulletin)
-  doc.text(employeeInfo.adresse || '-', margin + colW1 + 5, y + 7)
-  doc.text(`${employeeInfo.codePostal || ''} ${employeeInfo.ville || ''}`.trim() || '-', margin + colW1 + 5, y + 10)
+  doc.text(fitText(employeeInfo.adresse || '-', colW2 - 5), margin + colW1 + 5, y + 7)
+  doc.text(fitText(`${employeeInfo.codePostal || ''} ${employeeInfo.ville || ''}`.trim() || '-', colW2 - 5), margin + colW1 + 5, y + 10)
   doc.text(`N° Sécu : ${employeeInfo.numSecu || '-'}`, margin + colW1 + 5, y + 13.5)
   doc.text(`Matricule : ${employeeInfo.matricule || '-'}`, margin + colW1 + 5, y + 16.5)
   setColor(GRAY)
@@ -456,7 +456,13 @@ export function buildPdfDoc(JsPDF, data, employerInfo, employeeInfo, month, year
     cells.forEach((cell, i) => {
       const safe = cell == null ? '' : String(cell)
       if (i === 0) {
-        doc.text(safe, rx + (indent ? 5 : 2), baseline)
+        // Libellé jamais tronqué avant : un intitulé long (ex. "Contribution
+        // formation professionnelle (CFP, <11 salariés)") débordait de la colonne
+        // DÉSIGNATION (63mm) et se superposait au montant de la colonne BASE juste
+        // à droite. fitText() est déjà utilisé plus haut dans ce fichier pour le
+        // même problème (convention collective) — même traitement ici.
+        const pad = indent ? 5 : 2
+        doc.text(fitText(safe, colWidths[0] - pad - 1), rx + pad, baseline)
       } else {
         textRight(safe, rx + colWidths[i] - 1, baseline)
       }
