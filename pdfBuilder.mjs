@@ -61,6 +61,11 @@ export function buildPdfDoc(JsPDF, data, employerInfo, employeeInfo, month, year
   if (template === 'traditionnel') {
     return buildTraditionnelDoc(JsPDF, data, employerInfo, employeeInfo, month, year, options)
   }
+  // Même logique pour « cabinet » : géométrie propre (grille + calendrier
+  // journalier), rendu par sa propre fonction.
+  if (template === 'cabinet') {
+    return buildCabinetDoc(JsPDF, data, employerInfo, employeeInfo, month, year, options)
+  }
 
   const doc = new JsPDF('p', 'mm', 'a4')
   const pageW = 210
@@ -1315,6 +1320,505 @@ function buildTraditionnelDoc(JsPDF, data, employerInfo, employeeInfo, month, ye
 
   return doc
 }
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   MODÈLE « CABINET » — grille monospace + calendrier journalier.
+
+   Reproduit la mise en page des bulletins émis par les logiciels de cabinets
+   d'expertise comptable : grille à 5 colonnes en Courier, rubriques en
+   capitales grasses, totaux à points de conduite numérotés (1)(2)(4) qui
+   composent la formule du net, colonne « INFORMATIONS JOURNALIERES » jour par
+   jour, récapitulatif fiscal DU MOIS / DEPUIS, compteurs de congés.
+
+   Décodé le 14/09/2026 sur un bulletin de référence fourni par un prospect —
+   STRUCTURE uniquement : aucune valeur, aucun nom, aucun logo n'en est repris.
+
+   Nombres : l'original est imprimé sur un formulaire pré-imprimé dont la
+   ligne des décimales est tracée sur le papier — les chiffres sont posés de
+   part et d'autre, sans virgule. On reproduit ce dispositif : un filet
+   vertical fin par colonne numérique, entier à gauche, deux décimales à
+   droite, signe négatif SUFFIXÉ (« 8668- » = −86,68), pas de séparateur de
+   milliers. Le bloc congés, lui, est en clair avec virgule — comme sur
+   l'original, où il est hors formulaire.
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+/** Dimanche de Pâques (calendrier grégorien) — algorithme de Meeus/Jones/Butcher. */
+function dimanchePaques(year) {
+  const a = year % 19, b = Math.floor(year / 100), c = year % 100
+  const d = Math.floor(b / 4), e = b % 4, f = Math.floor((b + 8) / 25)
+  const g = Math.floor((b - f + 1) / 3), h = (19 * a + b - d - g + 15) % 30
+  const i = Math.floor(c / 4), k = c % 4, l = (32 + 2 * e + 2 * i - h - k) % 7
+  const m = Math.floor((a + 11 * h + 22 * l) / 451)
+  const month = Math.floor((h + l - 7 * m + 114) / 31)
+  const day = ((h + l - 7 * m + 114) % 31) + 1
+  return new Date(year, month - 1, day)
+}
+
+/**
+ * Jours fériés légaux de France métropolitaine (art. L.3133-1 du Code du
+ * travail) — 11 jours. Les jours propres à l'Alsace-Moselle (Vendredi saint,
+ * 26 décembre) et aux DOM ne sont PAS inclus. Renvoie un Set 'YYYY-MM-DD'.
+ */
+export function joursFeries(year) {
+  const p = dimanchePaques(year)
+  const plus = (d, n) => { const x = new Date(d); x.setDate(x.getDate() + n); return x }
+  const fixes = [[0, 1], [4, 1], [4, 8], [6, 14], [7, 15], [10, 1], [10, 11], [11, 25]]
+  const dates = fixes.map(([m, d]) => new Date(year, m, d))
+  dates.push(plus(p, 1), plus(p, 39), plus(p, 50)) // lundi de Pâques, Ascension, lundi de Pentecôte
+  const key = (d) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
+  return new Set(dates.map(key))
+}
+
+/**
+ * Calendrier journalier d'un mois de paie, tel qu'affiché par le modèle
+ * « cabinet ». Une entrée par jour civil : { jour, lettre, heures, incident }.
+ *
+ * ⚠️ HORAIRE THÉORIQUE, pas un relevé de pointage. Le moteur mensualise la
+ * paie sur l'horaire contractuel sans connaître la répartition réelle des
+ * heures : on affiche donc l'horaire contractuel réparti du lundi au vendredi
+ * (horaire mensuel × 12 / 52 / 5 — 7,00 h/j pour 151,67 h), rien le week-end,
+ * « JF » sur les jours fériés légaux tombant en semaine (jour férié chômé),
+ * et rien hors période de présence (entrée/sortie en cours de mois). Les
+ * congés et absences saisis sur le bulletin n'ont pas de dates : ils ne sont
+ * PAS reportés ici — plutôt que de les placer sur des jours inventés.
+ */
+export function calendrierMois(year, month, horaireMensuel, opts = {}) {
+  const feries = joursFeries(year)
+  const lastDay = new Date(year, month + 1, 0).getDate()
+  const hJour = Math.round(((parseFloat(horaireMensuel) || 0) * 12 / 52 / 5) * 100) / 100
+  const jourKey = (x) => { const d = new Date(x); return new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime() }
+  const debut = opts.presenceStart ? jourKey(opts.presenceStart) : null
+  const fin = opts.presenceEnd ? jourKey(opts.presenceEnd) : null
+  const LETTRES = ['D', 'L', 'M', 'M', 'J', 'V', 'S']
+  const out = []
+  for (let d = 1; d <= lastDay; d++) {
+    const date = new Date(year, month, d)
+    const t = date.getTime()
+    const dow = date.getDay()
+    const key = `${year}-${String(month + 1).padStart(2, '0')}-${String(d).padStart(2, '0')}`
+    const present = (debut == null || t >= debut) && (fin == null || t <= fin)
+    const weekend = dow === 0 || dow === 6
+    let heures = 0, incident = ''
+    if (present && !weekend) {
+      if (feries.has(key)) incident = 'JF'
+      else heures = hJour
+    }
+    out.push({ jour: d, lettre: LETTRES[dow], heures, incident })
+  }
+  return out
+}
+
+/** Capitales sans accents — la casse « mainframe » de ce modèle. */
+function capsCab(s) {
+  return String(s || '').normalize('NFD').replace(/[̀-ͯ]/g, '').toUpperCase()
+}
+
+const MOIS_CAB = ['JANVIER', 'FEVRIER', 'MARS', 'AVRIL', 'MAI', 'JUIN', 'JUILLET', 'AOUT', 'SEPTEMBRE', 'OCTOBRE', 'NOVEMBRE', 'DECEMBRE']
+
+const CAB = {
+  X0: 8, X1: 202,
+  // Grille principale (bord droit des colonnes numériques)
+  G_X1: 156, C_LBL_END: 88, C_BASE: 106, C_TAUX: 122, C_SAL: 139, C_PAT: 156,
+  LABEL_X: 9.5, SUB_X: 11,
+  // Calendrier
+  K_X0: 158, K_X1: 202, K_TRAV: 187, K_INC: 192,
+  // Repères verticaux
+  HEAD_TOP: 10, ROW2_Y: 44, EMPLOI_TOP: 65, EMPLOI_H: 14,
+  BODY_TOP: 82, BODY_HEAD_H: 9, BODY_BOTTOM: 195, LINE_H: 3.0,
+  NET_TOP: 198, NET_H: 15,
+  REV_TOP: 216, REV_H: 40,
+  CP_TOP: 259, CP_H: 24,
+  FOOT_Y: 289,
+}
+const CAB_INK = [0, 0, 0]
+const CAB_RULE = [0, 0, 0]
+const CAB_DEC = [170, 170, 170] // filet des décimales (le « pré-imprimé »)
+
+function buildCabinetDoc(JsPDF, data, employerInfo, employeeInfo, month, year, options = {}) {
+  const doc = new JsPDF('p', 'mm', 'a4')
+  patchTradText(doc)
+
+  const emp = employerInfo || {}
+  const sal = employeeInfo || {}
+  const lastDay = new Date(year, month + 1, 0).getDate()
+  const mm2 = String(month + 1).padStart(2, '0')
+  const periodStart = data.proration?.periodeDebut || `01/${mm2}/${year}`
+  const periodEnd = data.proration?.periodeFin || `${lastDay}/${mm2}/${year}`
+  const dateLongue = (ddmmyyyy) => {
+    const [d, m, y] = String(ddmmyyyy).split('/')
+    return `${d} ${MOIS_CAB[parseInt(m, 10) - 1] || ''} ${y}`
+  }
+  const dateTiret = (ddmmyyyy) => String(ddmmyyyy).replace(/\//g, '-')
+  const dateFRcab = (iso) => {
+    if (!iso) return ''
+    const d = new Date(iso); if (isNaN(d.getTime())) return ''
+    return `${String(d.getDate()).padStart(2, '0')}/${String(d.getMonth() + 1).padStart(2, '0')}/${d.getFullYear()}`
+  }
+
+  // ── Primitives ────────────────────────────────────────────────────────────
+  const mono = (size = 7, style = 'normal') => { doc.setFont('courier', style); doc.setFontSize(size) }
+  const sans = (size = 7, style = 'normal') => { doc.setFont('helvetica', style); doc.setFontSize(size) }
+  const ink = (c) => doc.setTextColor(c[0], c[1], c[2])
+  const stroke = (x, y, w, h, lw = 0.3, c = CAB_RULE) => {
+    doc.setDrawColor(c[0], c[1], c[2]); doc.setLineWidth(lw); doc.rect(x, y, w, h, 'S')
+  }
+  const rule = (x1, y1, x2, y2, lw = 0.25, c = CAB_RULE) => {
+    doc.setDrawColor(c[0], c[1], c[2]); doc.setLineWidth(lw); doc.line(x1, y1, x2, y2)
+  }
+  const right = (txt, x, y) => { const s = txt == null ? '' : String(txt); doc.text(s, x - doc.getTextWidth(s), y) }
+  const center = (txt, x, y) => { const s = txt == null ? '' : String(txt); doc.text(s, x - doc.getTextWidth(s) / 2, y) }
+  const chW = (size) => size * 0.6 * 0.352778 // avance fixe Courier, en mm
+  const clip = (str, maxMm, size) => {
+    const max = Math.max(1, Math.floor(maxMm / chW(size)))
+    const s = String(str || '')
+    return s.length <= max ? s : s.slice(0, max - 1) + '.'
+  }
+
+  /**
+   * Nombre « formulaire pré-imprimé » dans une colonne de bord droit `xr` :
+   * [entier][filet][2 décimales][signe]. Le signe négatif est suffixé.
+   * Renvoie le x gauche de l'entier (pour les points de conduite) ou null.
+   */
+  const cell = (value, xr, y, size, { keepZero = false, forceNeg = false } = {}) => {
+    const n = parseFloat(value)
+    if (!Number.isFinite(n) || (!keepZero && n === 0)) return null
+    const [intPart, decPart] = Math.abs(n).toFixed(2).split('.')
+    const ch = chW(size)
+    const signX = xr - ch
+    const decX = signX - 2 * ch
+    doc.text(decPart, decX, y)
+    const intX = decX - 0.5 - doc.getTextWidth(intPart)
+    doc.text(intPart, intX, y)
+    if (n < 0 || forceNeg) doc.text('-', signX, y)
+    return intX
+  }
+  /** Filet vertical des décimales d'une colonne, sur une hauteur donnée. */
+  const decRule = (xr, y0, y1, size) => {
+    const x = xr - chW(size) * 3 - 0.25
+    rule(x, y0, x, y1, 0.12, CAB_DEC)
+  }
+
+  // ═══ EN-TÊTE ═══════════════════════════════════════════════════════════════
+  // Gauche : raison sociale en grand (à la place du logo de l'original), puis
+  // l'encadré arrondi de l'établissement.
+  sans(15, 'bold'); ink(CAB_INK)
+  doc.text(clip(capsCab(emp.nom || ''), 100, 15), CAB.X0, CAB.HEAD_TOP + 6)
+  doc.setDrawColor(0, 0, 0); doc.setLineWidth(0.35)
+  doc.roundedRect(CAB.X0 + 12, CAB.HEAD_TOP + 10, 78, 20, 2.5, 2.5, 'S')
+  mono(8); ink(CAB_INK)
+  const etab = [
+    capsCab(emp.nom || ''),
+    capsCab(emp.adresse || ''),
+    capsCab([emp.codePostal, emp.ville].filter(Boolean).join(' ')),
+  ]
+  etab.forEach((l, i) => doc.text(clip(l, 72, 8), CAB.X0 + 16, CAB.HEAD_TOP + 16 + i * 5))
+
+  // Droite : titre + identifiants
+  sans(15, 'bold'); ink(CAB_INK)
+  doc.text('BULLETIN DE PAIE', 118, CAB.HEAD_TOP + 6)
+  const kvR = (label, value, y) => {
+    sans(6.2); ink(CAB_INK)
+    doc.text(label, 118, y)
+    doc.text(':', 160, y)
+    mono(8); doc.text(String(value == null ? '' : value), 163, y)
+  }
+  let hy = CAB.HEAD_TOP + 12.5
+  kvR('MATRICULE', sal.matricule || '', hy); hy += 4.2
+  kvR('PERIODE D\'EMPLOI    DU', dateLongue(periodStart), hy); hy += 4.2
+  kvR('AU', dateLongue(periodEnd), hy); hy += 4.2
+  kvR('DATE DE PAIEMENT', dateLongue(periodEnd), hy); hy += 4.2
+  kvR('NO DE SECURITE SOCIALE', String(sal.numSecu || '').replace(/\s/g, ''), hy)
+
+  // ═══ 2ᵉ RANG : SIRET / APE / CCN — identité du salarié ══════════════════════
+  let y = CAB.ROW2_Y
+  sans(6.2); ink(CAB_INK)
+  doc.text('N° SIRET:', CAB.X0, y)
+  mono(8); doc.text(String(emp.siret || '').replace(/\s/g, ''), CAB.X0 + 24, y)
+  sans(6.2); doc.text('N° APE:', CAB.X0 + 62, y)
+  mono(8); doc.text(String(emp.codeAPE || ''), CAB.X0 + 76, y)
+  sans(6.2); doc.text('CONVENTION', CAB.X0, y + 6); doc.text('COLLECTIVE:', CAB.X0, y + 9.5)
+  const ccn = capsCab(emp.conventionName || emp.convention || '')
+  mono(8)
+  doc.splitTextToSize(ccn, 70).slice(0, 2).forEach((l, i) => doc.text(l, CAB.X0 + 24, y + 6 + i * 3.6))
+
+  mono(9, 'bold')
+  doc.text(clip(capsCab([sal.nom, sal.prenom].filter(Boolean).join(' ')), 80, 9), 118, y + 3)
+  mono(8, 'bold')
+  doc.text(clip(capsCab(sal.adresse || ''), 80, 8), 118, y + 10)
+  doc.text(clip(capsCab([sal.codePostal, sal.ville].filter(Boolean).join(' ')), 80, 8), 118, y + 14)
+
+  // ═══ ENCADRÉ EMPLOI (3 colonnes) ════════════════════════════════════════════
+  const ey = CAB.EMPLOI_TOP
+  stroke(CAB.X0, ey, CAB.X1 - CAB.X0, CAB.EMPLOI_H, 0.3)
+  rule(78, ey, 78, ey + CAB.EMPLOI_H); rule(140, ey, 140, ey + CAB.EMPLOI_H)
+  const kvE = (label, value, x, yy, colon) => {
+    mono(6.6); ink(CAB_INK)
+    doc.text(label, x, yy); doc.text(':' + String(value == null ? '' : value), colon, yy)
+  }
+  const classif = [
+    sal.statut ? capsCab(sal.statut) : '',
+    sal.niveau ? `NIV. ${sal.niveau}` : '',
+    sal.coefficient ? `COEF. ${sal.coefficient}` : '',
+    sal.echelon ? `ECH. ${sal.echelon}` : '',
+  ].filter(Boolean).join(' ')
+  kvE('AFFECTATION', clip(capsCab(emp.nom || ''), 44, 6.6), CAB.X0 + 2, ey + 4, CAB.X0 + 30)
+  kvE('EMPLOI', clip(capsCab(sal.emploi || ''), 44, 6.6), CAB.X0 + 2, ey + 7.5, CAB.X0 + 30)
+  kvE('CLASSIFICATION', clip(classif, 44, 6.6), CAB.X0 + 2, ey + 11, CAB.X0 + 30)
+  kvE('DATE ENTREE', dateFRcab(sal.dateEntree), 80, ey + 4, 112)
+  kvE('DATE ANCIENNETE', dateFRcab(sal.dateEntree), 80, ey + 7.5, 112)
+  const hm = parseFloat(data.horaireContractuel ?? data.horaireMensuel) || 0
+  mono(6.6); doc.text(hm >= 151.67 ? 'TEMPS PLEIN' : 'TEMPS PARTIEL', 142, ey + 4)
+  doc.text('TAUX HORAIRE :', 142, ey + 7.5)
+  right(formatMontant(data.tauxHoraire), CAB.X1 - 3, ey + 7.5)
+
+  // ═══ GRILLE PRINCIPALE — lignes ═════════════════════════════════════════════
+  // kind : 'item' (ligne chiffrée) | 'cat' (rubrique en gras) | 'total' (à points
+  // de conduite) | 'note' (libellé seul, sans montant) | 'gap'
+  const rows = []
+  const item = (o) => rows.push({ kind: 'item', ...o })
+
+  item({ label: 'SALAIRE DE BASE', base: data.horaireMensuel, salAmt: data.salaireBase })
+  ;(data.absencesLignes || []).forEach((a) => {
+    if ((a.heures || 0) > 0) {
+      item({ label: `ABS. ${capsCab(a.label || 'ABSENCE')}`, base: a.heures, taux: data.tauxHoraire, salAmt: -(a.heures * (parseFloat(data.tauxHoraire) || 0)) })
+    }
+  })
+  if (data.heuresSuppLignes && data.heuresSuppLignes.length > 0) {
+    data.heuresSuppLignes.forEach((l) => {
+      if ((l.heures || 0) > 0) item({ label: capsCab(l.label || `HEURES SUPP. ${l.tauxMult}%`), base: l.heures, taux: l.computedTauxHS, salAmt: l.brut })
+    })
+  } else if (data.heuresSupp > 0) {
+    item({ label: 'HEURES SUPPLEMENTAIRES', base: data.heuresSupp, taux: data.tauxHS, salAmt: data.hsBrut })
+  }
+  if (data.primes && data.primes.length > 0) {
+    data.primes.forEach((p) => { if ((p.montant || 0) > 0) item({ label: capsCab(p.label || 'PRIME'), salAmt: p.montant }) })
+  } else if (data.primeExceptionnelle > 0) {
+    item({ label: 'PRIME EXCEPTIONNELLE', salAmt: data.primeExceptionnelle })
+  }
+  rows.push({ kind: 'total', label: '*REMUNERATION BRUTE.(1)', col: 'sal', value: data.totalBrut })
+
+  // Cotisations, regroupées par rubrique. Une rubrique à ligne unique est
+  // portée par sa propre ligne (comme FAMILLE / ASSURANCE CHOMAGE sur
+  // l'original) ; à plusieurs lignes, en-tête gras puis lignes en retrait.
+  const groups = []
+  ;(data.cotisations || []).forEach((c) => {
+    const last = groups[groups.length - 1]
+    if (last && last.category === c.category) last.items.push(c)
+    else groups.push({ category: c.category, items: [c] })
+  })
+  groups.forEach((g) => {
+    // Ligne unique fusionnée avec sa rubrique SEULEMENT si le nom de la ligne
+    // n'apporte rien de plus (ex. « Famille » / « Allocations familiales »).
+    // Sinon — prévoyance cadre rangée sous « Santé » en fin de liste — on garde
+    // en-tête + ligne : fusionner ferait disparaître le nom de la cotisation.
+    const fusionnable = (c, cat) => {
+      const a = capsCab(c.name).replace(/[^A-Z]/g, ''), b = capsCab(cat).replace(/[^A-Z]/g, '')
+      return a === b || b.includes(a) || (a.includes(b) && a.length - b.length <= 12)
+    }
+    if (g.items.length === 1 && fusionnable(g.items[0], g.category)) {
+      const c = g.items[0]
+      item({ label: capsCab(g.category), cap: true, base: c.base, taux: c.tauxSal, salAmt: c.partSal > 0 ? -c.partSal : 0, patAmt: c.partPat > 0 ? c.partPat : 0 })
+    } else {
+      rows.push({ kind: 'cat', label: capsCab(g.category) })
+      g.items.forEach((c) => item({ label: capsCab(c.name), sub: true, base: c.base, taux: c.tauxSal, salAmt: c.partSal > 0 ? -c.partSal : 0, patAmt: c.partPat > 0 ? c.partPat : 0 }))
+    }
+  })
+  if ((data.totalAllegements || 0) > 0) {
+    item({ label: 'EXONERATIONS ET ALLEGEMENTS DE COTISATIONS', cap: true, patAmt: -data.totalAllegements })
+  }
+  rows.push({ kind: 'total', label: '*COTISAT.SALARIALES.(2)', col: 'sal', value: -(data.totalCotisSal || 0) })
+  rows.push({ kind: 'total', label: '*COTISAT.PATRONALES', col: 'pat', value: data.totalCotisPat })
+  item({ label: 'IMPOT SUR LE REVENU PRELEVE', cap: true, base: data.baseIR, taux: data.tauxIR, salAmt: -(data.irPreleve || 0) })
+  rows.push({ kind: 'note', label: data.irAuto ? 'TAUX NON PERSONNALISE' : 'TAUX PERSONNALISE' })
+  rows.push({ kind: 'total', label: '*AUTRES RETENUES....(4)', col: 'sal', value: -(data.irPreleve || 0) })
+
+  // Tenue sur une page : l'interligne (et le corps avec lui) se resserre si le
+  // bulletin est long, jamais sous le plancher de lisibilité.
+  const AVAIL = CAB.BODY_BOTTOM - (CAB.BODY_TOP + CAB.BODY_HEAD_H + 3)
+  const lineH = rows.length > 0 ? Math.min(CAB.LINE_H, AVAIL / rows.length) : CAB.LINE_H
+  const bodySize = Math.max(4.8, Math.min(6.6, (lineH / CAB.LINE_H) * 6.6))
+
+  // ── Cadre + en-tête à deux rangs ──
+  const gy = CAB.BODY_TOP
+  stroke(CAB.X0, gy, CAB.G_X1 - CAB.X0, CAB.BODY_BOTTOM - gy, 0.3)
+  rule(CAB.X0, gy + CAB.BODY_HEAD_H, CAB.G_X1, gy + CAB.BODY_HEAD_H)
+  ;[CAB.C_LBL_END, CAB.C_BASE, CAB.C_TAUX, CAB.C_SAL].forEach((x) => rule(x, gy, x, CAB.BODY_BOTTOM))
+  rule(CAB.C_BASE, gy + 4.5, CAB.C_SAL, gy + 4.5) // sous « PART EMPLOYE »
+  sans(5.4); ink(CAB_INK)
+  center('DESIGNATION', (CAB.X0 + CAB.C_LBL_END) / 2, gy + 6)
+  center('NOMBRE', (CAB.C_LBL_END + CAB.C_BASE) / 2, gy + 3.4)
+  center('OU BASE', (CAB.C_LBL_END + CAB.C_BASE) / 2, gy + 7.6)
+  center('PART EMPLOYE', (CAB.C_BASE + CAB.C_SAL) / 2, gy + 3.4)
+  center('TAUX OU %', (CAB.C_BASE + CAB.C_TAUX) / 2, gy + 7.6)
+  center('MONTANT', (CAB.C_TAUX + CAB.C_SAL) / 2, gy + 7.6)
+  center('EMPLOYEUR', (CAB.C_SAL + CAB.C_PAT) / 2, gy + 3.4)
+  center('MONTANT', (CAB.C_SAL + CAB.C_PAT) / 2, gy + 7.6)
+
+  // Filets des décimales — le « pré-imprimé » — sur la hauteur du corps
+  const bodyY0 = gy + CAB.BODY_HEAD_H
+  ;[CAB.C_BASE, CAB.C_TAUX, CAB.C_SAL, CAB.C_PAT].forEach((xr) => decRule(xr, bodyY0, CAB.BODY_BOTTOM, bodySize))
+
+  // ── Corps ──
+  let yy = bodyY0 + lineH + 0.6
+  const lblMax = CAB.C_LBL_END - CAB.LABEL_X - 1
+  rows.forEach((r) => {
+    ink(CAB_INK)
+    if (r.kind === 'gap') { yy += lineH; return }
+    if (r.kind === 'cat') {
+      mono(bodySize, 'bold'); doc.text(clip(r.label, lblMax, bodySize), CAB.LABEL_X, yy); yy += lineH; return
+    }
+    if (r.kind === 'note') {
+      mono(bodySize); doc.text(clip(r.label, lblMax, bodySize), CAB.LABEL_X, yy); yy += lineH; return
+    }
+    if (r.kind === 'total') {
+      mono(bodySize, 'bold')
+      const xr = r.col === 'pat' ? CAB.C_PAT : CAB.C_SAL
+      const intX = cell(r.value, xr, yy, bodySize, { keepZero: true })
+      // Points de conduite du libellé jusqu'au nombre — traversant les colonnes
+      // intermédiaires, comme sur l'original.
+      const label = r.label
+      doc.text(label, CAB.LABEL_X, yy)
+      const from = CAB.LABEL_X + doc.getTextWidth(label)
+      const to = (intX ?? xr) - chW(bodySize) * 0.6
+      const n = Math.max(0, Math.floor((to - from) / chW(bodySize)))
+      if (n > 0) doc.text('.'.repeat(n), from, yy)
+      yy += lineH; return
+    }
+    mono(bodySize, r.cap ? 'bold' : 'normal')
+    const x = r.sub ? CAB.SUB_X : CAB.LABEL_X
+    doc.text(clip(r.label, CAB.C_LBL_END - x - 1, bodySize), x, yy)
+    mono(bodySize)
+    cell(r.base, CAB.C_BASE, yy, bodySize)
+    cell(r.taux, CAB.C_TAUX, yy, bodySize)
+    cell(r.salAmt, CAB.C_SAL, yy, bodySize)
+    cell(r.patAmt, CAB.C_PAT, yy, bodySize)
+    yy += lineH
+  })
+
+  // ═══ CALENDRIER JOURNALIER ═══════════════════════════════════════════════════
+  const kx0 = CAB.K_X0, kx1 = CAB.K_X1, kw = kx1 - kx0
+  stroke(kx0, gy, kw, CAB.REV_TOP + CAB.REV_H - gy, 0.3)
+  sans(4.6, 'bold'); ink(CAB_INK)
+  center('INFORMATIONS JOURNALIERES', kx0 + kw / 2, gy + 3)
+  sans(4.6)
+  center(`DU ${dateTiret(periodStart)}  AU ${dateTiret(periodEnd)}`, kx0 + kw / 2, gy + 6.4)
+  rule(kx0, gy + 7.6, kx1, gy + 7.6)
+  const kJour = kx0 + 9, kTrav = CAB.K_TRAV
+  sans(4.2)
+  center('JOUR', kx0 + 5.5, gy + 10.4)
+  center('TRAVAIL', (kJour + 3 + kTrav) / 2, gy + 10.4)
+  center('INCIDENT', (kTrav + kx1) / 2, gy + 10.4)
+  rule(kx0, gy + 11.6, kx1, gy + 11.6)
+  rule(kJour + 2, gy + 7.6, kJour + 2, gy + 11.6); rule(kTrav + 0.5, gy + 7.6, kTrav + 0.5, gy + 11.6)
+
+  const cal = calendrierMois(year, month, hm, { presenceStart: data.proration?.presenceStart, presenceEnd: data.proration?.presenceEnd })
+  const kSize = 6
+  const kLine = Math.min(3.0, (CAB.BODY_BOTTOM - (gy + 13)) / Math.max(28, cal.length))
+  decRule(kTrav, gy + 12, gy + 12 + kLine * cal.length + 1, kSize)
+  cal.forEach((d, i) => {
+    const ky = gy + 12 + kLine * (i + 1)
+    mono(kSize); ink(CAB_INK)
+    doc.text(`${d.lettre} ${String(d.jour).padStart(2, '0')}`, kx0 + 1.5, ky)
+    if (d.heures > 0) cell(d.heures, kTrav, ky, kSize)
+    if (d.incident) doc.text(d.incident, CAB.K_INC, ky)
+  })
+
+  // ═══ NET SOCIAL / NET AVANT IMPÔT ═══════════════════════════════════════════
+  const ny = CAB.NET_TOP
+  stroke(CAB.X0, ny, CAB.G_X1 - CAB.X0, CAB.NET_H, 0.3)
+  rule(CAB.C_SAL, ny, CAB.C_SAL, ny + CAB.NET_H)
+  decRule(CAB.C_PAT, ny, ny + CAB.NET_H, 7.2)
+  mono(7.2, 'bold'); ink(CAB_INK)
+  doc.text('MONTANT NET SOCIAL', CAB.LABEL_X, ny + 5)
+  cell(data.netSocial, CAB.C_PAT, ny + 5, 7.2, { keepZero: true })
+  doc.text('NET A PAYER AVANT IMPOT SUR LE REVENU', CAB.LABEL_X, ny + 11.5)
+  cell(data.netAvantIR, CAB.C_PAT, ny + 11.5, 7.2, { keepZero: true })
+
+  // ═══ REVENUS EN EUROS (mois / cumul) + NET A PAYER ══════════════════════════
+  const ry = CAB.REV_TOP
+  const cum = data.cumuls || {}
+  // Bloc gauche
+  const rx0 = CAB.X0, rx1 = 92, rMois = 66, rCum = 91
+  stroke(rx0, ry, rx1 - rx0, CAB.REV_H, 0.3)
+  rule(46, ry, 46, ry + CAB.REV_H); rule(rMois + 1.5, ry, rMois + 1.5, ry + CAB.REV_H)
+  rule(rx0, ry + 4.6, rx1, ry + 4.6)
+  mono(6.2); ink(CAB_INK)
+  doc.text('REVENUS EN EUROS', rx0 + 1.5, ry + 3.3)
+  center('DU MOIS', (46 + rMois + 1.5) / 2, ry + 3.3)
+  center(`DEPUIS 01 ${year}`, (rMois + 1.5 + rx1) / 2, ry + 3.3)
+  decRule(rMois, ry + 4.6, ry + CAB.REV_H, 6.2); decRule(rCum, ry + 4.6, ry + CAB.REV_H, 6.2)
+  const rLine = (label, m, c, yy2) => {
+    mono(6.2); doc.text(label, rx0 + 1.5, yy2)
+    cell(m, rMois, yy2, 6.2, { keepZero: true }); cell(c, rCum, yy2, 6.2, { keepZero: true })
+  }
+  rLine('PRELEVEMENT A LA SOURCE', data.irPreleve, cum.irPreleve, ry + 9)
+  rLine('TOTAL VERSE EMPLOYEUR', data.totalVerseEmployeur, cum.totalVerse, ry + 13)
+  rLine('NET FISCAL', data.baseIR, cum.netImposable, ry + 23)
+  doc.setLineDashPattern([0.6, 0.6], 0); rule(rx0 + 1.5, ry + 26, 44, ry + 26, 0.2); doc.setLineDashPattern([], 0)
+  // Cumul des HS/HC exonérées : non suivi par le moteur → seule la valeur du mois.
+  mono(6.2); doc.text('HS/HC EXONEREES FISCAL', rx0 + 1.5, ry + 31)
+  cell(data.hsBrut, rMois, ry + 31, 6.2)
+
+  // Bloc NET A PAYER — double cadre comme sur l'original
+  const nx0 = 94, nx1 = CAB.G_X1
+  stroke(nx0, ry, nx1 - nx0, CAB.REV_H, 0.7)
+  stroke(nx0 + 1, ry + 1, nx1 - nx0 - 2, CAB.REV_H - 2, 0.25)
+  rule(nx0 + 1, ry + 12, nx1 - 1, ry + 12, 0.7)
+  mono(7, 'bold'); ink(CAB_INK)
+  doc.text('NET A PAYER', nx0 + 3, ry + 5.2)
+  mono(5); doc.text('1-2-4', nx0 + 3, ry + 8)
+  mono(7, 'bold'); doc.text('EN EUROS', nx0 + 3, ry + 11)
+  decRule(nx1 - 3, ry + 1, ry + 12, 9.5)
+  mono(9.5, 'bold'); cell(data.netAPayer, nx1 - 3, ry + 7, 9.5, { keepZero: true })
+  const mode = capsCab(data.modePaiement || sal.modePaiement || 'VIREMENT')
+  mono(7, 'bold'); doc.text(mode, nx0 + 26, ry + 11)
+  mono(7, 'bold'); doc.text(clip(capsCab([sal.prenom, sal.nom].filter(Boolean).join(' ')), 56, 7), nx0 + 6, ry + 17)
+  if (sal.iban) { mono(6.6, 'bold'); doc.text(`IBAN: ${sal.iban}`, nx0 + 3, ry + 22) }
+  if (sal.bic) { mono(6.6, 'bold'); doc.text(`BIC : ${sal.bic}`, nx0 + 3, ry + 26) }
+
+  // ═══ CONGÉS PAYÉS / COMMENTAIRES / LÉGENDE ══════════════════════════════════
+  const cy = CAB.CP_TOP
+  stroke(CAB.X0, cy, rx1 - CAB.X0, CAB.CP_H, 0.3)
+  const lv = data.leave || {}
+  const prisN1 = Math.min(lv.cpN1Acquis || 0, lv.cumulCongesPris || 0)
+  const prisN = (lv.cumulCongesPris || 0) > (lv.cpN1Acquis || 0) ? (lv.cumulCongesPris || 0) - (lv.cpN1Acquis || 0) : 0
+  mono(6.2); ink(CAB_INK)
+  doc.text('CONGES PAYES---  ACQUIS       PRIS      SOLDE', CAB.X0 + 1.5, cy + 4)
+  const cpRow = (label, a, p, s, yy3) => {
+    doc.text(label, CAB.X0 + 1.5, yy3)
+    right(formatMontant(a), CAB.X0 + 34, yy3); right(formatMontant(p), CAB.X0 + 50, yy3); right(formatMontant(s), CAB.X0 + 66, yy3)
+  }
+  cpRow('EN COURS', lv.cpNAcquis || 0, prisN, lv.cpNSolde || 0, cy + 8)
+  cpRow('ACQUIS', lv.cpN1Acquis || 0, prisN1, lv.cpN1Solde || 0, cy + 12)
+  doc.text('--- ----------------- --- ----------------', CAB.X0 + 1.5, cy + 16)
+
+  stroke(nx0, cy, nx1 - nx0, CAB.CP_H, 0.3)
+  rule(nx0 + 5, cy, nx0 + 5, cy + CAB.CP_H)
+  sans(4.6); ink(CAB_INK)
+  doc.text('COMMENTAIRES', nx0 + 3.6, cy + CAB.CP_H - 2, { angle: 90 })
+
+  stroke(kx0, cy, kw, CAB.CP_H, 0.3)
+  mono(6.2); ink(CAB_INK)
+  doc.text('JF J.FERIE CHOME PAYE', kx0 + 1.5, cy + 4.5)
+
+  // ═══ PIED ═══════════════════════════════════════════════════════════════════
+  sans(5.4); ink(CAB_INK)
+  center('Nous vous recommandons de conserver votre bulletin de paie, sans limitation de durée - Pour davantage d\'informations, voir la rubrique dédiée au bulletin de paie sur www.service-public.fr.', 105, CAB.FOOT_Y)
+
+  if (options.watermark) {
+    const n = doc.getNumberOfPages()
+    for (let p = 1; p <= n; p++) {
+      doc.setPage(p)
+      try { doc.setGState(new doc.GState({ opacity: 0.13 })) } catch { /* Deno : ignoré */ }
+      doc.setTextColor(180, 40, 40); doc.setFont('helvetica', 'bold'); doc.setFontSize(30)
+      for (let k = 0; k < 5; k++) doc.text('SPÉCIMEN — NON PAYÉ', 22, 60 + k * 52, { angle: 33 })
+      try { doc.setGState(new doc.GState({ opacity: 1 })) } catch { /* Deno : ignoré */ }
+    }
+  }
+
+  return doc
+}
+
 
 /** SIRET « XXX XXX XXX XXXXX » — copie locale (celle de buildPdfDoc lui est interne). */
 function formatSiretTrad(siret) {
