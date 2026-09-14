@@ -1755,9 +1755,12 @@ function buildCabinetDoc(JsPDF, data, employerInfo, employeeInfo, month, year, o
   rLine('TOTAL VERSE EMPLOYEUR', data.totalVerseEmployeur, cum.totalVerse, ry + 13)
   rLine('NET FISCAL', data.baseIR, cum.netImposable, ry + 23)
   doc.setLineDashPattern([0.6, 0.6], 0); rule(rx0 + 1.5, ry + 26, 44, ry + 26, 0.2); doc.setLineDashPattern([], 0)
-  // Cumul des HS/HC exonérées : non suivi par le moteur → seule la valeur du mois.
+  // « HS/HC exonérées fiscal » : libellé conservé pour la fidélité au gabarit,
+  // mais valeur VOLONTAIREMENT vide. Le moteur ne retire pas les heures sup de
+  // la base IR (baseIR = netAvantIR + CSG/CRDS imposable), il n'exonère donc
+  // rien : y inscrire hsBrut affirmerait une exonération qui n'a pas eu lieu.
+  // (L'exonération légale des HS — art. 81 quater CGI — est un chantier moteur.)
   mono(6.2); doc.text('HS/HC EXONEREES FISCAL', rx0 + 1.5, ry + 31)
-  cell(data.hsBrut, rMois, ry + 31, 6.2)
 
   // Bloc NET A PAYER — double cadre comme sur l'original
   const nx0 = 94, nx1 = CAB.G_X1
