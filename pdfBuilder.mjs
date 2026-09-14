@@ -1371,7 +1371,8 @@ export function joursFeries(year) {
 
 /**
  * Calendrier journalier d'un mois de paie, tel qu'affiché par le modèle
- * « cabinet ». Une entrée par jour civil : { jour, lettre, heures, incident }.
+ * « cabinet ». Une entrée par jour civil :
+ * { jour, lettre, heures, incident, heuresIncident }.
  *
  * ⚠️ HORAIRE THÉORIQUE, pas un relevé de pointage. Le moteur mensualise la
  * paie sur l'horaire contractuel sans connaître la répartition réelle des
@@ -1398,12 +1399,12 @@ export function calendrierMois(year, month, horaireMensuel, opts = {}) {
     const key = `${year}-${String(month + 1).padStart(2, '0')}-${String(d).padStart(2, '0')}`
     const present = (debut == null || t >= debut) && (fin == null || t <= fin)
     const weekend = dow === 0 || dow === 6
-    let heures = 0, incident = ''
+    let heures = 0, incident = '', heuresIncident = 0
     if (present && !weekend) {
-      if (feries.has(key)) incident = 'JF'
+      if (feries.has(key)) { incident = 'JF'; heuresIncident = hJour } // férié chômé payé : la journée est comptée en incident
       else heures = hJour
     }
-    out.push({ jour: d, lettre: LETTRES[dow], heures, incident })
+    out.push({ jour: d, lettre: LETTRES[dow], heures, incident, heuresIncident })
   }
   return out
 }
@@ -1499,33 +1500,52 @@ function buildCabinetDoc(JsPDF, data, employerInfo, employeeInfo, month, year, o
   }
 
   // ═══ EN-TÊTE ═══════════════════════════════════════════════════════════════
-  // Gauche : raison sociale en grand (à la place du logo de l'original), puis
-  // l'encadré arrondi de l'établissement.
-  sans(15, 'bold'); ink(CAB_INK)
-  doc.text(clip(capsCab(emp.nom || ''), 100, 15), CAB.X0, CAB.HEAD_TOP + 6)
+  // Gauche : le logo de l'entreprise (data URL, redimensionné à la saisie —
+  // voir Entreprise.jsx) dans une zone de 62 × 16 mm, proportions conservées ;
+  // à défaut, la raison sociale en grand. Puis l'encadré arrondi de
+  // l'établissement, comme sur l'original.
+  let logoOk = false
+  if (emp.logo && /^data:image\/(png|jpeg|jpg|webp);base64,/.test(emp.logo)) {
+    try {
+      const pr = doc.getImageProperties(emp.logo)
+      const BW = 62, BH = 14
+      const k = Math.min(BW / pr.width, BH / pr.height)
+      const w = pr.width * k, h = pr.height * k
+      doc.addImage(emp.logo, pr.fileType || 'PNG', CAB.X0, CAB.HEAD_TOP - 4 + (BH - h) / 2, w, h)
+      logoOk = true
+    } catch (e) { logoOk = false } // image illisible → repli texte, jamais de PDF cassé
+  }
+  if (!logoOk) {
+    sans(15, 'bold'); ink(CAB_INK)
+    doc.text(clip(capsCab(emp.nom || ''), 100, 15), CAB.X0, CAB.HEAD_TOP + 6)
+  }
   doc.setDrawColor(0, 0, 0); doc.setLineWidth(0.35)
-  doc.roundedRect(CAB.X0 + 12, CAB.HEAD_TOP + 10, 78, 20, 2.5, 2.5, 'S')
+  doc.roundedRect(CAB.X0 + 12, CAB.HEAD_TOP + 11, 78, 18, 2.5, 2.5, 'S')
   mono(8); ink(CAB_INK)
   const etab = [
     capsCab(emp.nom || ''),
     capsCab(emp.adresse || ''),
     capsCab([emp.codePostal, emp.ville].filter(Boolean).join(' ')),
   ]
-  etab.forEach((l, i) => doc.text(clip(l, 72, 8), CAB.X0 + 16, CAB.HEAD_TOP + 16 + i * 5))
+  etab.forEach((l, i) => doc.text(clip(l, 72, 8), CAB.X0 + 16, CAB.HEAD_TOP + 16.5 + i * 5))
 
   // Droite : titre + identifiants
   sans(15, 'bold'); ink(CAB_INK)
   doc.text('BULLETIN DE PAIE', 118, CAB.HEAD_TOP + 6)
-  const kvR = (label, value, y) => {
+  // Libellés à gauche, deux-points sur une colonne fixe, valeurs en mono.
+  // « DU » et « AU » sont calés à DROITE, contre les deux-points, sous
+  // « PERIODE D'EMPLOI » — disposition de l'original.
+  const kvR = (label, value, y, alignRight = false) => {
     sans(6.2); ink(CAB_INK)
-    doc.text(label, 118, y)
+    if (alignRight) right(label, 158.5, y); else doc.text(label, 118, y)
     doc.text(':', 160, y)
     mono(8); doc.text(String(value == null ? '' : value), 163, y)
   }
   let hy = CAB.HEAD_TOP + 12.5
   kvR('MATRICULE', sal.matricule || '', hy); hy += 4.2
-  kvR('PERIODE D\'EMPLOI    DU', dateLongue(periodStart), hy); hy += 4.2
-  kvR('AU', dateLongue(periodEnd), hy); hy += 4.2
+  kvR('PERIODE D\'EMPLOI', `${mm2}/${year}`, hy); hy += 4.2
+  kvR('DU', dateLongue(periodStart), hy, true); hy += 4.2
+  kvR('AU', dateLongue(periodEnd), hy, true); hy += 4.2
   kvR('DATE DE PAIEMENT', dateLongue(periodEnd), hy); hy += 4.2
   kvR('NO DE SECURITE SOCIALE', String(sal.numSecu || '').replace(/\s/g, ''), hy)
 
@@ -1542,10 +1562,10 @@ function buildCabinetDoc(JsPDF, data, employerInfo, employeeInfo, month, year, o
   doc.splitTextToSize(ccn, 70).slice(0, 2).forEach((l, i) => doc.text(l, CAB.X0 + 24, y + 6 + i * 3.6))
 
   mono(9, 'bold')
-  doc.text(clip(capsCab([sal.nom, sal.prenom].filter(Boolean).join(' ')), 80, 9), 118, y + 3)
+  doc.text(clip(capsCab([sal.nom, sal.prenom].filter(Boolean).join(' ')), 80, 9), 118, y + 7)
   mono(8, 'bold')
-  doc.text(clip(capsCab(sal.adresse || ''), 80, 8), 118, y + 10)
-  doc.text(clip(capsCab([sal.codePostal, sal.ville].filter(Boolean).join(' ')), 80, 8), 118, y + 14)
+  doc.text(clip(capsCab(sal.adresse || ''), 80, 8), 118, y + 13)
+  doc.text(clip(capsCab([sal.codePostal, sal.ville].filter(Boolean).join(' ')), 80, 8), 118, y + 17)
 
   // ═══ ENCADRÉ EMPLOI (3 colonnes) ════════════════════════════════════════════
   const ey = CAB.EMPLOI_TOP
@@ -1563,7 +1583,7 @@ function buildCabinetDoc(JsPDF, data, employerInfo, employeeInfo, month, year, o
   ].filter(Boolean).join(' ')
   kvE('AFFECTATION', clip(capsCab(emp.nom || ''), 44, 6.6), CAB.X0 + 2, ey + 4, CAB.X0 + 30)
   kvE('EMPLOI', clip(capsCab(sal.emploi || ''), 44, 6.6), CAB.X0 + 2, ey + 7.5, CAB.X0 + 30)
-  kvE('CLASSIFICATION', clip(classif, 44, 6.6), CAB.X0 + 2, ey + 11, CAB.X0 + 30)
+  kvE('CLASSIFICATION', clip(classif, 44, 6.6), CAB.X0 + 2, ey + 12, CAB.X0 + 30)
   kvE('DATE ENTREE', dateFRcab(sal.dateEntree), 80, ey + 4, 112)
   kvE('DATE ANCIENNETE', dateFRcab(sal.dateEntree), 80, ey + 7.5, 112)
   const hm = parseFloat(data.horaireContractuel ?? data.horaireMensuel) || 0
@@ -1697,7 +1717,9 @@ function buildCabinetDoc(JsPDF, data, employerInfo, employeeInfo, month, year, o
 
   // ═══ CALENDRIER JOURNALIER ═══════════════════════════════════════════════════
   const kx0 = CAB.K_X0, kx1 = CAB.K_X1, kw = kx1 - kx0
-  stroke(kx0, gy, kw, CAB.REV_TOP + CAB.REV_H - gy, 0.3)
+  // Une seule boîte, du haut de la grille au bas des congés ; la légende des
+  // codes d'incident vit DANS cette boîte, sous un filet — comme l'original.
+  stroke(kx0, gy, kw, CAB.CP_TOP + CAB.CP_H - gy, 0.3)
   sans(4.6, 'bold'); ink(CAB_INK)
   center('INFORMATIONS JOURNALIERES', kx0 + kw / 2, gy + 3)
   sans(4.6)
@@ -1714,13 +1736,21 @@ function buildCabinetDoc(JsPDF, data, employerInfo, employeeInfo, month, year, o
   const cal = calendrierMois(year, month, hm, { presenceStart: data.proration?.presenceStart, presenceEnd: data.proration?.presenceEnd })
   const kSize = 6
   const kLine = Math.min(3.0, (CAB.BODY_BOTTOM - (gy + 13)) / Math.max(28, cal.length))
+  const kIncNum = kTrav + 9 // bord droit du nombre d'heures d'incident
   decRule(kTrav, gy + 12, gy + 12 + kLine * cal.length + 1, kSize)
+  decRule(kIncNum, gy + 12, gy + 12 + kLine * cal.length + 1, kSize)
   cal.forEach((d, i) => {
     const ky = gy + 12 + kLine * (i + 1)
     mono(kSize); ink(CAB_INK)
     doc.text(`${d.lettre} ${String(d.jour).padStart(2, '0')}`, kx0 + 1.5, ky)
-    if (d.heures > 0) cell(d.heures, kTrav, ky, kSize)
-    if (d.incident) doc.text(d.incident, CAB.K_INC, ky)
+    if (d.incident) {
+      // Jour férié chômé payé : les heures du jour passent en INCIDENT avec le
+      // code, la colonne TRAVAIL reste vide — disposition de l'original.
+      cell(d.heuresIncident, kIncNum, ky, kSize)
+      doc.text(d.incident, kIncNum + 1.2, ky)
+    } else if (d.heures > 0) {
+      cell(d.heures, kTrav, ky, kSize)
+    }
   })
 
   // ═══ NET SOCIAL / NET AVANT IMPÔT ═══════════════════════════════════════════
@@ -1800,7 +1830,7 @@ function buildCabinetDoc(JsPDF, data, employerInfo, employeeInfo, month, year, o
   sans(4.6); ink(CAB_INK)
   doc.text('COMMENTAIRES', nx0 + 3.6, cy + CAB.CP_H - 2, { angle: 90 })
 
-  stroke(kx0, cy, kw, CAB.CP_H, 0.3)
+  rule(kx0, cy, kx1, cy)
   mono(6.2); ink(CAB_INK)
   doc.text('JF J.FERIE CHOME PAYE', kx0 + 1.5, cy + 4.5)
 
