@@ -745,7 +745,15 @@ export function buildPdfDoc(JsPDF, data, employerInfo, employeeInfo, month, year
   doc.text('Libellé', rightX + 2, rightY + 2.4)
   textRight('CP N-1', rightX + cW0 + cW1 - 2, rightY + 2.4)
   textRight('CP N', rightX + cW0 + cW1 + cW2 - 2, rightY + 2.4)
-  textRight('RTT', rightX + gridW - 2, rightY + 2.4)
+  // Colonne RTT laissée VIDE (en-tête compris) pour un salarié sans RTT —
+  // c'est-à-dire tout salarié à 35 h sans accord : afficher « RTT 0,00 »
+  // suggérait un droit qui n'existe pas. La géométrie de la grille est
+  // inchangée (aucune régression de mise en page sur ces 3 modèles).
+  const lv0 = data.leave
+  const avecRtt = lv0
+    ? ((lv0.rttAcquis || 0) > 0 || (lv0.cumulRttPris || 0) > 0)
+    : (parseFloat(employeeInfo.rtt) || 0) > 0
+  if (avecRtt) textRight('RTT', rightX + gridW - 2, rightY + 2.4)
   rightY += 3.5
 
   // Acquis row
@@ -770,7 +778,7 @@ export function buildPdfDoc(JsPDF, data, employerInfo, employeeInfo, month, year
 
   textRight(formatMontant(leave.cpN1Acquis), rightX + cW0 + cW1 - 2, rightY + 2.4)
   textRight(formatMontant(leave.cpNAcquis), rightX + cW0 + cW1 + cW2 - 2, rightY + 2.4)
-  textRight(formatMontant(leave.rttAcquis), rightX + gridW - 2, rightY + 2.4)
+  if (avecRtt) textRight(formatMontant(leave.rttAcquis), rightX + gridW - 2, rightY + 2.4)
   rightY += 3.5
 
   // Pris row
@@ -782,7 +790,7 @@ export function buildPdfDoc(JsPDF, data, employerInfo, employeeInfo, month, year
   
   textRight(formatMontant(cpN1Pris), rightX + cW0 + cW1 - 2, rightY + 2.4)
   textRight(formatMontant(cpNPris), rightX + cW0 + cW1 + cW2 - 2, rightY + 2.4)
-  textRight(formatMontant(rttPrisVal), rightX + gridW - 2, rightY + 2.4)
+  if (avecRtt) textRight(formatMontant(rttPrisVal), rightX + gridW - 2, rightY + 2.4)
   rightY += 3.5
 
   // Solde row
@@ -793,7 +801,7 @@ export function buildPdfDoc(JsPDF, data, employerInfo, employeeInfo, month, year
   doc.text('Solde disponible', rightX + 2, rightY + 2.4)
   textRight(formatMontant(leave.cpN1Solde), rightX + cW0 + cW1 - 2, rightY + 2.4)
   textRight(formatMontant(leave.cpNSolde), rightX + cW0 + cW1 + cW2 - 2, rightY + 2.4)
-  textRight(formatMontant(leave.rttSolde), rightX + gridW - 2, rightY + 2.4)
+  if (avecRtt) textRight(formatMontant(leave.rttSolde), rightX + gridW - 2, rightY + 2.4)
   rightY += 8
 
   // Box D: Cumuls
@@ -1214,7 +1222,8 @@ function buildTraditionnelDoc(JsPDF, data, employerInfo, employeeInfo, month, ye
         const LH = 2.1                            // 4 lignes -> 8.4 mm ; MODE DE REGLEMENT suit à RECAP_TOP-1.6
         const cX = [T.X0, 44, 60, 78]             // libellé, acquis, pris, solde (alignés à droite)
         sans(4.6, 'bold'); ink(TRAD_NAVY)
-        doc.text('CONGES PAYES ET RTT (en jours)', cX[0], cy)
+        const avecRttT = (lv.rttAcquis || 0) > 0 || (lv.cumulRttPris || 0) > 0
+        doc.text(avecRttT ? 'CONGES PAYES ET RTT (en jours)' : 'CONGES PAYES (en jours)', cX[0], cy)
         right('ACQUIS', cX[1], cy); right('PRIS', cX[2], cy); right('SOLDE', cX[3], cy)
         // « Pris » = cumul depuis le début de la période de référence, ventilé
         // N-1 d'abord puis N — même règle que le moteur (calculations.js) et
@@ -1225,7 +1234,7 @@ function buildTraditionnelDoc(JsPDF, data, employerInfo, employeeInfo, month, ye
           ['CP N-1', lv.cpN1Acquis, prisN1, lv.cpN1Solde],
           ['CP N', lv.cpNAcquis, prisN, lv.cpNSolde],
           ['RTT', lv.rttAcquis, lv.cumulRttPris, lv.rttSolde],
-        ]
+        ].filter((r) => r[0] !== 'RTT' || avecRttT)
         lignes.forEach((r, i) => {
           const y = cy + LH * (i + 1)
           mono(5); ink([0, 0, 0])
