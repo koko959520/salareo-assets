@@ -688,7 +688,19 @@ export function buildPdfDoc(JsPDF, data, employerInfo, employeeInfo, month, year
   doc.setFont('helvetica', 'bold')
   setColor(DANGER_RED)
   textRight(`-${formatMontant(data.irPreleve)}`, margin + gridW - 2, leftY + 3)
-  leftY += 8
+  leftY += 4.5
+  // Mention obligatoire dès qu'il y a des heures sup./compl. exonérées d'impôt
+  // (arrêté du 31/01/2023 : « Montant net des heures compl/suppl exonérées »).
+  if ((data.montantNetHSExonere || 0) > 0) {
+    drawRect(margin, leftY, gridW, 4.5)
+    doc.setFont('helvetica', 'normal')
+    setColor(BLACK)
+    doc.text('Montant net des heures compl/suppl exonérées', margin + 2, leftY + 3)
+    doc.setFont('helvetica', 'bold')
+    textRight(formatMontant(data.montantNetHSExonere), margin + gridW - 2, leftY + 3)
+    leftY += 4.5
+  }
+  leftY += 3.5
 
   // Box B: Autres Informations
   fillRect(margin, leftY, gridW, 3.8, LIGHT_GRAY)
@@ -1251,6 +1263,16 @@ function buildTraditionnelDoc(JsPDF, data, employerInfo, employeeInfo, month, ye
       const mode = data.modePaiement || emp.modePaiement || 'VIREMENT'
       mono(6.4); ink([0, 0, 0])
       doc.text(`MODE DE REGLEMENT : ${String(mode).toUpperCase()}`, T.X0, T.RECAP_TOP - 1.6)
+
+      // Montant net des heures sup./compl. exonérées d'impôt (art. 81 quater
+      // CGI, libellé de l'arrêté du 31/01/2023). Pas de place dans le bloc
+      // impôt — l'encadré NET A PAYER est collé dessous — donc sur la bande
+      // libre à droite du mode de règlement, alignée sur l'encadré du net.
+      const hsMois = data.montantNetHSExonere || 0
+      const hsCumul = data.cumuls?.hsExonere || 0
+      if (hsMois > 0 || hsCumul > 0) {
+        right(`MONTANT NET DES HEURES COMPL/SUPPL EXONEREES : ${fmtTrad(hsMois, true)}  (CUMUL ${fmtTrad(hsCumul, true)})`, T.C4 + 33.5, T.RECAP_TOP - 1.6)
+      }
     }
 
     // Encadré NET À PAYER EN EUROS
@@ -1794,12 +1816,15 @@ function buildCabinetDoc(JsPDF, data, employerInfo, employeeInfo, month, year, o
   rLine('TOTAL VERSE EMPLOYEUR', data.totalVerseEmployeur, cum.totalVerse, ry + 13)
   rLine('NET FISCAL', data.baseIR, cum.netImposable, ry + 23)
   doc.setLineDashPattern([0.6, 0.6], 0); rule(rx0 + 1.5, ry + 26, 44, ry + 26, 0.2); doc.setLineDashPattern([], 0)
-  // « HS/HC exonérées fiscal » : libellé conservé pour la fidélité au gabarit,
-  // mais valeur VOLONTAIREMENT vide. Le moteur ne retire pas les heures sup de
-  // la base IR (baseIR = netAvantIR + CSG/CRDS imposable), il n'exonère donc
-  // rien : y inscrire hsBrut affirmerait une exonération qui n'a pas eu lieu.
-  // (L'exonération légale des HS — art. 81 quater CGI — est un chantier moteur.)
+  // « HS/HC exonérées fiscal » : montant net exonéré d'impôt (art. 81 quater
+  // CGI), du mois et cumulé. Vide sans heures sup. — comme le gabarit
+  // d'origine. Les bulletins figés avant le 08/10/2026 n'ont pas ce champ
+  // (le moteur n'exonérait rien) et restent donc vides, à juste titre.
   mono(6.2); doc.text('HS/HC EXONEREES FISCAL', rx0 + 1.5, ry + 31)
+  if ((data.montantNetHSExonere || 0) > 0 || (cum.hsExonere || 0) > 0) {
+    cell(data.montantNetHSExonere || 0, rMois, ry + 31, 6.2, { keepZero: true })
+    cell(cum.hsExonere || 0, rCum, ry + 31, 6.2, { keepZero: true })
+  }
 
   // Bloc NET A PAYER — double cadre comme sur l'original
   const nx0 = 94, nx1 = CAB.G_X1
