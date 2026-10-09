@@ -66,6 +66,11 @@ export function buildPdfDoc(JsPDF, data, employerInfo, employeeInfo, month, year
   if (template === 'cabinet') {
     return buildCabinetDoc(JsPDF, data, employerInfo, employeeInfo, month, year, options)
   }
+  // « encadré » : cadres arrondis + cumuls/congés, décrit par layoutEncadre
+  // (même description pour le PDF et l'aperçu écran).
+  if (template === 'encadre') {
+    return buildEncadreDoc(JsPDF, data, employerInfo, employeeInfo, month, year, options)
+  }
 
   const doc = new JsPDF('p', 'mm', 'a4')
   const pageW = 210
@@ -1891,4 +1896,408 @@ function buildCabinetDoc(JsPDF, data, employerInfo, employeeInfo, month, year, o
 function formatSiretTrad(siret) {
   const d = String(siret || '').replace(/\s/g, '')
   return d.length === 14 ? `${d.slice(0, 3)} ${d.slice(3, 6)} ${d.slice(6, 9)} ${d.slice(9)}` : (siret || '')
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   MODÈLE « ENCADRÉ » — cadres arrondis, rubriques en gras, cumuls et congés.
+
+   Mise en page des bulletins « clarifiés » produits par les logiciels de paie
+   des cabinets : titre en haut à gauche, cadre identité du salarié, cadres gris
+   employeur et destinataire, tableau LIBELLE / BASE / TAUX / A PAYER /
+   Taux Pat. / Mt Pat. avec bandeaux gris pour les totaux, blocs net avant
+   impôt, impôt sur le revenu, net à payer, total versé employeur, cumuls
+   période / année, congés et repos, mention légale de pied de page.
+
+   Relevé le 09/10/2026 sur trois bulletins de référence (janvier à mars 2026) :
+   géométrie lue DANS LE FLUX PDF (opérateurs re/m/l/c et Tm/Td/TJ) — positions
+   au dixième de point, Helvetica / Helvetica-Bold / Helvetica-Oblique, traits
+   0,4 / 0,5 / 0,9 pt, gris 242, rayons 2 et 3 pt, interligne de 10 pt.
+   STRUCTURE uniquement : aucune valeur, aucun nom, aucun SIRET n'en est repris.
+
+   Une seule description de la page sert aux deux rendus : `layoutEncadre`
+   renvoie une liste de primitives (cadres, filets, textes) en points depuis le
+   coin haut-gauche ; `buildEncadreDoc` la trace avec jsPDF, l'aperçu écran
+   (BulletinPreviewEncadre.jsx) la trace en SVG. L'aperçu et le PDF payé ne
+   peuvent donc pas diverger.
+
+   Données absentes de Salareo (bases de congés payés, repos compensateur,
+   remboursements de frais…) : cellules laissées VIDES plutôt que remplies avec
+   une valeur plausible — la mise en page est reproduite, jamais les données.
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+const ENC_GRIS = 242
+/** Repli si le calcul ne fournit pas `plafondSS` (bulletins enregistrés avant le 09/10/2026). */
+const ENC_PMSS = { 2024: 3864, 2025: 3925, 2026: 4005 }
+
+/* Largeurs AFM Helvetica / Helvetica-Bold (1/1000 em), caractères 32 à 126 puis
+   lettres accentuées : mesurer un texte SANS document jsPDF, pour que l'ajustement
+   des libellés longs soit identique dans le PDF et dans l'aperçu SVG. */
+const ENC_W = [278, 278, 355, 556, 556, 889, 667, 191, 333, 333, 389, 584, 278, 333, 278, 278, 556, 556, 556, 556, 556, 556, 556, 556, 556, 556, 278, 278, 584, 584, 584, 556, 1015, 667, 667, 722, 722, 667, 611, 778, 722, 278, 500, 667, 556, 833, 722, 778, 667, 778, 722, 667, 611, 722, 667, 944, 667, 667, 611, 278, 278, 278, 469, 556, 333, 556, 556, 500, 556, 556, 278, 556, 556, 222, 222, 500, 222, 833, 556, 556, 556, 556, 333, 500, 278, 556, 500, 722, 500, 500, 500, 334, 260, 334, 584]
+const ENC_WB = [278, 333, 474, 556, 556, 889, 722, 238, 333, 333, 389, 584, 278, 333, 278, 278, 556, 556, 556, 556, 556, 556, 556, 556, 556, 556, 333, 333, 584, 584, 584, 611, 975, 722, 722, 722, 722, 667, 611, 778, 722, 278, 556, 722, 611, 833, 722, 778, 667, 778, 722, 667, 611, 722, 667, 944, 667, 667, 611, 333, 278, 333, 584, 556, 333, 556, 611, 556, 611, 556, 333, 611, 611, 278, 278, 556, 278, 889, 611, 611, 611, 611, 389, 556, 333, 611, 556, 778, 556, 556, 500, 389, 280, 389, 584]
+const ENC_ACC = { à: 'a', â: 'a', ä: 'a', é: 'e', è: 'e', ê: 'e', ë: 'e', î: 'i', ï: 'i', ô: 'o', ö: 'o', ù: 'u', û: 'u', ü: 'u', ÿ: 'y', ç: 'c', À: 'A', Â: 'A', É: 'E', È: 'E', Ê: 'E', Ë: 'E', Î: 'I', Ô: 'O', Ù: 'U', Û: 'U', Ç: 'C', '’': "'", '°': 'o', '«': '<', '»': '>' }
+
+function encW(s, size, bold = false) {
+  const t = bold ? ENC_WB : ENC_W
+  let u = 0
+  for (const ch of String(s || '')) {
+    const c = ENC_ACC[ch] || ch
+    const code = c.charCodeAt(0)
+    u += code >= 32 && code <= 126 ? t[code - 32] : 556
+  }
+  return (u / 1000) * size
+}
+/** Taille réduite pour que `s` tienne dans `maxW` (jamais sous `min`). */
+function encFit(s, size, maxW, bold = false, min = 5) {
+  const w = encW(s, size, bold)
+  return w <= maxW ? size : Math.max(min, (size * maxW) / w)
+}
+/** Tronque `s` (suivi d'un point) s'il déborde encore de `maxW` à la taille donnée. */
+function encClip(s, size, maxW, bold = false) {
+  let t = String(s || '')
+  if (encW(t, size, bold) <= maxW) return t
+  while (t.length > 1 && encW(`${t}.`, size, bold) > maxW) t = t.slice(0, -1)
+  return `${t.trimEnd()}.`
+}
+/** Nombre FR « 5 434,13 » (espace normale, signe moins devant) ; '' si nul sauf `keepZero`. */
+function encNum(v, dec = 2, keepZero = false) {
+  const n = parseFloat(v)
+  if (!Number.isFinite(n) || (!keepZero && Math.abs(n) < 0.0005)) return ''
+  const [i, d] = Math.abs(n).toFixed(dec).split('.')
+  return (n < 0 && Math.abs(n) >= 0.0005 ? '-' : '') + i.replace(/\B(?=(\d{3})+(?!\d))/g, ' ') + (dec > 0 ? `,${d}` : '')
+}
+const encPct = (v) => { const s = encNum(v, 3); return s ? `${s} %` : '' }
+/** Majuscules sans accents, comme les rubriques de l'original (« SANTE », « ASSURANCE CHOMAGE »). */
+const encCaps = (s) => String(s || '').normalize('NFD').replace(/[̀-ͯ]/g, '').toUpperCase()
+
+/** Libellés des rubriques : catégorie du moteur → intitulé du bulletin. */
+const ENC_RUBRIQUES = {
+  'Santé': 'SANTE',
+  'Retraite': 'RETRAITE',
+  'Famille - Sécurité sociale': 'FAMILLE',
+  'Assurance chômage': 'ASSURANCE CHOMAGE',
+  "Autres contributions dues par l'employeur": "AUTRES CONTRIBUTIONS DUES PAR L'EMPLOYEUR",
+}
+/** Ordre des rubriques sur l'original ; les catégories inconnues se placent avant « AUTRES ». */
+/** Abscisse de départ des libellés de bandeau sur l'original (alignés à droite sur 317 pt). */
+const ENC_BANDES = { 'Total brut': 284.7, 'Total des cotisations et contributions': 192.5, 'MONTANT NET SOCIAL': 237.7 }
+const ENC_ORDRE = ['Santé', '__AT__', 'Retraite', 'Famille - Sécurité sociale', 'Assurance chômage', '__AUTRES_INCONNUES__', "Autres contributions dues par l'employeur", 'CSG/CRDS']
+
+/**
+ * Description complète de la page (points, origine en haut à gauche, A4 595 × 842).
+ * @returns {{ w: number, h: number, ops: Array<object> }}
+ *   ops : { k:'rr', x,y,w,h,r, fill (gris|null), lw }  cadre arrondi
+ *         { k:'ln', x1,y1,x2,y2, lw }                   filet
+ *         { k:'lb', x,y0,y1,x1, r, lw }                 trait épais gauche + bas (relief des tableaux)
+ *         { k:'tx', s, x, y, size, st:'n'|'b'|'i', al:'l'|'r'|'c' }  texte (y = ligne de base)
+ */
+export function layoutEncadre(data, employerInfo, employeeInfo, month, year) {
+  const d = data || {}
+  const emp = employerInfo || {}
+  const sal = employeeInfo || {}
+  const ops = []
+  const rr = (x, y, w, h, r, fill, lw = 0) => ops.push({ k: 'rr', x, y, w, h, r, fill: fill ? ENC_GRIS : null, lw })
+  const ln = (x1, y1, x2, y2, lw = 0.5) => ops.push({ k: 'ln', x1, y1, x2, y2, lw })
+  const lb = (x, y0, y1, x1) => ops.push({ k: 'lb', x, y0, y1, x1, r: 3, lw: 0.9 })
+  const texts = []
+  const tx = (s, x, y, size, st = 'n', al = 'l') => {
+    const t = s == null ? '' : String(s)
+    if (t.trim()) texts.push({ k: 'tx', s: t, x, y, size, st, al })
+  }
+
+  // ── Période ───────────────────────────────────────────────────────────────
+  const mm = String(month + 1).padStart(2, '0')
+  const daysInMonth = new Date(year, month + 1, 0).getDate()
+  const periodStart = d.proration?.periodeDebut || `01/${mm}/${year}`
+  const periodEnd = d.proration?.periodeFin || `${daysInMonth}/${mm}/${year}`
+  const joursPeriode = d.proration?.partial ? (d.proration.joursPresents || 0) : daysInMonth
+
+  const pmss = parseFloat(d.plafondSS) || ENC_PMSS[year] || 4005
+  const hs = parseFloat(d.heuresSupp) || 0
+  const heuresPayees = (parseFloat(d.horaireMensuel) || 0) + hs
+  const heuresTheo = (parseFloat(d.horaireContractuel ?? d.horaireMensuel) || 0) + hs
+
+  // ── Lignes du tableau ─────────────────────────────────────────────────────
+  // kind : 'line' (élément, retrait) | 'head' (rubrique en gras, valeurs éventuelles)
+  //        | 'band' (total sur bandeau gris) | 'blank'
+  const rows = []
+  const line = (o) => rows.push({ kind: 'line', ...o })
+
+  line({ label: 'Salaire de base', base: d.horaireMensuel, taux: d.tauxHoraire, tauxEur: true, amt: d.salaireBase })
+  // Absences : le moteur calcule le salaire de base sur les heures RÉELLEMENT
+  // payées (absences déjà déduites) — ligne indicative en heures, sans montant,
+  // pour ne pas déduire deux fois.
+  ;(d.absencesLignes || []).forEach((a) => {
+    if ((parseFloat(a.heures) || 0) > 0) line({ label: `Absence ${a.label || ''}`.trim(), base: -a.heures })
+  })
+  if (d.heuresSuppLignes && d.heuresSuppLignes.length > 0) {
+    d.heuresSuppLignes.forEach((l) => {
+      if ((l.heures || 0) > 0) line({ label: l.label || `Heures supplémentaires ${l.tauxMult}%`, base: l.heures, taux: l.computedTauxHS, tauxEur: true, amt: l.brut })
+    })
+  } else if (hs > 0) {
+    line({ label: 'Heures supplémentaires', base: hs, taux: d.tauxHS, tauxEur: true, amt: d.hsBrut })
+  }
+  if (d.primes && d.primes.length > 0) {
+    d.primes.forEach((p) => { if ((p.montant || 0) > 0) line({ label: p.label || 'Prime', amt: p.montant }) })
+  } else if (d.primeExceptionnelle > 0) {
+    line({ label: 'Prime exceptionnelle', amt: d.primeExceptionnelle })
+  }
+  rows.push({ kind: 'band', label: 'Total brut', amt: d.totalBrut })
+
+  // Rubriques de cotisations, dans l'ordre de l'original.
+  const groupes = new Map()
+  ;(d.cotisations || []).forEach((c) => {
+    let cat = c.category || ''
+    if (/^accident/i.test(c.name || '')) cat = '__AT__'
+    if (!groupes.has(cat)) groupes.set(cat, [])
+    groupes.get(cat).push(c)
+  })
+  const connues = new Set(ENC_ORDRE)
+  const ordre = []
+  ENC_ORDRE.forEach((cat) => {
+    if (cat === '__AUTRES_INCONNUES__') { for (const k of groupes.keys()) if (!connues.has(k)) ordre.push(k) } else if (groupes.has(cat)) ordre.push(cat)
+  })
+  const valeurs = (c) => ({
+    base: c.base, taux: c.tauxSal, amt: c.partSal > 0 ? -c.partSal : 0,
+    tpat: c.tauxPat, mpat: c.partPat > 0 ? -c.partPat : 0,
+  })
+  ordre.forEach((cat) => {
+    const items = groupes.get(cat)
+    if (cat === '__AT__') {
+      items.forEach((c) => rows.push({ kind: 'head', label: 'ACCIDENT DU TRAVAIL-MALADIES PROFESSIONNELLES', ...valeurs(c) }))
+    } else if (cat === 'CSG/CRDS') {
+      // Intitulés réglementaires du bulletin clarifié (arrêté du 25/02/2016).
+      items.forEach((c) => {
+        const nom = c.name || ''
+        const label = /non imposable/i.test(nom) ? "CSG déductible de l'impôt sur le revenu"
+          : /imposable/i.test(nom) ? "CSG/CRDS non déductible de l'impôt sur le revenu" : nom
+        rows.push({ kind: 'head', label, ...valeurs(c) })
+      })
+    } else if (cat === "Autres contributions dues par l'employeur") {
+      // Ligne unique, part patronale agrégée — comme l'original.
+      const total = items.reduce((s, c) => s + (parseFloat(c.partPat) || 0), 0)
+      rows.push({ kind: 'head', label: ENC_RUBRIQUES[cat], mpat: total > 0 ? -total : 0 })
+    } else if (items.length === 1 && cat === 'Famille - Sécurité sociale') {
+      rows.push({ kind: 'head', label: ENC_RUBRIQUES[cat], ...valeurs(items[0]) })
+    } else {
+      rows.push({ kind: 'head', label: ENC_RUBRIQUES[cat] || encCaps(cat) })
+      items.forEach((c) => line({ label: c.name, ...valeurs(c) }))
+    }
+  })
+
+  if ((d.exoCotisSalHS || 0) > 0) {
+    rows.push({ kind: 'head', label: 'EXONERATION DE COTISATIONS SALARIALES (HEURES SUP.)', taux: d.tauxExoSal, amt: d.exoCotisSalHS })
+  }
+  const exoPat = (parseFloat(d.allegementPatHS) || 0) + (parseFloat(d.reductionGenerale) || 0)
+  if (exoPat > 0) rows.push({ kind: 'head', label: 'EXONERATIONS DE COTISATIONS EMPLOYEUR', mpat: exoPat })
+
+  rows.push({ kind: 'blank' })
+  line({ label: 'Net imposable', amt: d.baseIR })
+  rows.push({ kind: 'band', label: 'Total des cotisations et contributions', amt: -(d.totalCotisSal || 0), mpat: -(d.totalCotisPat || 0) })
+  rows.push({ kind: 'band', label: 'MONTANT NET SOCIAL', amt: d.netSocial })
+
+  // Une page garantie : au-delà de 38 lignes, l'interligne (10 pt) et le corps
+  // se resserrent ensemble, jamais sous 5 pt.
+  const FIRST = 252.6
+  const LAST = 626
+  const pitch = rows.length > 1 ? Math.min(10, (LAST - FIRST) / (rows.length - 1)) : 10
+  const sc = pitch / 10
+  const fs = Math.max(5, 7 * sc)
+  const fsHead = Math.max(5, 7.2 * sc)
+
+  // ── Cadres (ordre du flux d'origine : les bandeaux de totaux passent SOUS les filets) ──
+  rr(245, 63, 325, 85, 2, true, 0.5)          // employeur
+  rr(245, 152, 325, 73, 2, true, 0.5)         // destinataire
+  rr(20, 91, 220, 133, 2, false, 0.5)         // identité du salarié
+  rr(20, 637, 550, 11, 2, true, 0.5)          // net avant impôt
+  rr(20, 653, 550, 11, 2, true, 0.5)          // bandeau impôt sur le revenu
+  ;[312, 376, 440, 505].forEach((x) => ln(x, 653, x, 683))
+  rr(20, 653, 550, 30, 3, false, 0.4); lb(20, 655, 683, 568)
+  rr(20, 688, 550, 11, 3, true, 0.4)          // net à payer
+  rr(20, 714, 550, 11, 3, true, 0.4)          // total versé employeur
+  rr(20, 730, 550, 11, 3, true, 0.4)          // bandeau des cumuls
+  ;[60, 124, 186, 249, 312, 376, 440, 505].forEach((x) => ln(x, 730, x, 760))
+  rr(20, 730, 550, 30, 3, false, 0.4); lb(20, 732, 760, 568)
+  rr(20, 765, 550, 31, 3, true, 0.4)          // congés et repos
+  rows.forEach((r, i) => { if (r.kind === 'band') rr(20, FIRST + i * pitch - 7.5 * sc, 550, 10.5 * sc, 3, true, 0) })
+  rr(20, 234, 550, 12, 3, true, 0)            // bandeau des colonnes
+  ;[320, 370, 430, 485].forEach((x) => ln(x, 234, x, 245))
+  rr(20, 234, 550, 11, 3, false, 0.4); lb(20, 236, 245, 568)
+  ;[320, 370, 430, 485].forEach((x) => ln(x, 245, x, 632))
+  rr(20, 245, 550, 387, 3, false, 0.4); lb(20, 247, 632, 568)
+
+  // ── En-tête ───────────────────────────────────────────────────────────────
+  tx('BULLETIN DE PAIE', 23, 54, 16, 'b')
+  tx('Paye du :', 23, 76, 9); tx(periodStart, 93, 76, 9); tx('au :', 146.1, 76, 9); tx(periodEnd, 173, 76, 9)
+
+  const raison = emp.raisonSociale || emp.nom || ''
+  tx(encClip(raison, encFit(raison, 11, 312, true, 7), 312, true), 253, 76, encFit(raison, 11, 312, true, 7), 'b')
+  if (emp.libelleAPE) {
+    const s = encFit(emp.libelleAPE, 6.6, 312, false, 4.8)
+    tx(encClip(emp.libelleAPE, s, 312), 253, 104, s)
+  }
+  tx(encClip(emp.adresse, 9, 312), 253, 113.6, 9)
+  tx(emp.codePostal, 253, 125.6, 9); tx(encClip(emp.ville, 9, 272), 293, 125.6, 9)
+  tx('NAF', 253, 141, 9); tx(emp.codeAPE, 293, 137.6, 9)
+  tx('SIRET', 373, 141, 9); tx(String(emp.siret || '').replace(/\s/g, ''), 403, 137.6, 9)
+
+  ;[['Matricule', 105], ['N° S.S.', 117], ['Emploi', 129], ['Qualification', 141], ['Coefficient', 153],
+    ['Entrée le', 177], ['Heures payées', 203], ['Plafond période', 215]].forEach(([l, y]) => tx(l, 23, y, 9))
+  tx(encClip(sal.matricule, 9, 155), 83, 104, 9)
+  tx(encClip(sal.numSecu, 9, 155), 83, 117, 9)
+  tx(encClip(sal.emploi, 9, 155), 83, 125.6, 9)
+  tx(encClip(sal.statut, 9, 155), 83, 137.6, 9)
+  tx(encClip([sal.niveau, sal.coefficient, sal.echelon].filter(Boolean).join('  '), 9, 155), 83, 149.6, 9)
+  tx(formatDateFR(sal.dateEntree), 83, 174.6, 9)
+  tx(encNum(heuresPayees, 3, true), 93, 200.6, 9)
+  tx(`T : ${encNum(heuresTheo, 3, true)}`, 173, 200.6, 9)
+  tx(encNum(pmss, 2, true), 93, 213.6, 9)
+  if (joursPeriode > 0 && joursPeriode < 31) tx(`${joursPeriode} /31`, 173, 213.6, 9)
+
+  const civ = sal.sexe === 'F' ? 'Mme' : sal.sexe === 'M' ? 'M.' : ''
+  const nomComplet = [civ, String(sal.nom || '').toUpperCase(), sal.prenom].filter(Boolean).join(' ')
+  const sNom = encFit(nomComplet, 10, 270, true, 7)
+  tx(encClip(nomComplet, sNom, 270, true), 293, 161.6, sNom, 'b')
+  tx(encClip(sal.adresse, 10, 270), 293, 187.6, 10)
+  tx(encClip([sal.codePostal, sal.ville].filter(Boolean).join('  '), 10, 270), 293, 200.6, 10)
+
+  // Convention collective — ou, à défaut, la référence au Code du travail (art. R.3243-1, 3°).
+  const ccn = emp.conventionName
+    ? `C.C.N. ${emp.conventionName}${emp.conventionIdcc ? ` (${emp.conventionIdcc})` : ''}`
+    : 'Convention collective : Code du travail'
+  tx(encClip(ccn, 7, 540), 26.9, 231, 7)
+
+  // ── Tableau ───────────────────────────────────────────────────────────────
+  tx('LIBELLE', 31.9, 242, 8, 'b'); tx('BASE', 331.4, 242, 8, 'b'); tx('TAUX', 391.9, 242, 8, 'b')
+  tx('A PAYER', 442, 242, 8, 'b'); tx('Taux Pat.', 489.6, 242, 8, 'b'); tx('Mt Pat.', 540.8, 242, 8, 'b')
+
+  // Bords droits des colonnes numériques (l'original termine les montants par une espace).
+  const cells = (r, y, st) => {
+    tx(encNum(r.base, 2), 367, y, fs, st, 'r')
+    // Taux en € à 3 décimales comme l'original, 4 quand il en a 4 (taux déduit
+    // d'un salaire mensuel : 2 000 € / 151,67 h = 13,1865).
+    const decEur = Math.abs(r.taux * 1000 - Math.round(r.taux * 1000)) > 1e-6 ? 4 : 3
+    tx(r.tauxEur ? encNum(r.taux, decEur) : encPct(r.taux), 427, y, fs, st, 'r')
+    tx(encNum(r.amt), 480.05, y, fs, st, 'r')
+    tx(encPct(r.tpat), 517, y, fs, st, 'r')
+    tx(encNum(r.mpat), 565.05, y, fs, st, 'r')
+  }
+  rows.forEach((r, i) => {
+    const y = FIRST + i * pitch
+    if (r.kind === 'blank') return
+    if (r.kind === 'band') {
+      // Libellés fixes posés à leur abscisse d'origine (bord droit à 317 pt) ; repli aligné à droite.
+      const x0 = ENC_BANDES[r.label]
+      if (x0 != null && sc === 1) tx(r.label, x0, y, fs, 'b'); else tx(r.label, 317, y, fs, 'b', 'r')
+      cells(r, y, 'b')
+      return
+    }
+    const head = r.kind === 'head'
+    const x = head ? 23 : 27.84
+    const size = head ? fsHead : fs
+    tx(encClip(r.label, size, 317 - x, head), x, y, size, head ? 'b' : 'n')
+    cells(r, y, 'n')
+  })
+
+  // ── Pied : impôt, net, cumuls, congés ─────────────────────────────────────
+  tx('MONTANT NET A PAYER AVANT IMPOT SUR LE REVENU', 23, 644, 7, 'b')
+  tx(encNum(d.netAvantIR, 2, true), 565.05, 644, 7, 'b', 'r')
+
+  tx('IMPOT SUR LE REVENU', 23, 660, 7, 'b'); tx('Base', 336.8, 660, 7, 'b')
+  tx(d.irAuto === false ? 'Tx personnalisé' : 'Tx non pers.', 389.5, 660, 7, 'b')
+  tx('Montant', 459.2, 660, 7, 'b'); tx('Montant annuel', 511.4, 660, 7, 'b')
+  tx('Impôt sur le revenu prélevé à la source', 23, 670, 7, 'i')
+  tx(encNum(d.baseIR, 2, true), 371.05, 670, 7, 'i', 'r')
+  tx(encNum(d.tauxIR, 3, true), 435.05, 670, 7, 'i', 'r')
+  tx(encNum(d.irPreleve, 2, true), 500.05, 670, 7, 'i', 'r')
+  tx('Régularisation sur le revenu', 23, 680, 7, 'i')
+
+  tx('MONTANT NET A PAYER (en Euros)', 23, 695, 7, 'b')
+  tx(encNum(d.netAPayer, 2, true), 567, 695, 7, 'b', 'r')
+  const mode = String(d.modePaiement || emp.modePaiement || 'VIREMENT').toUpperCase()
+  tx(`Paiement le ${periodEnd} par ${mode}${mode === 'VIREMENT' ? ' sur  RIB' : ''}`, 23, 709, 7)
+  tx('TOTAL VERSE EMPLOYEUR', 23, 721, 7, 'b')
+  tx(encNum(d.totalVerseEmployeur, 2, true), 567, 721, 7, 'b', 'r')
+
+  ;[['Cumuls', 23], ['Brut', 84.8], ['Plafond S.S.', 135.6], ['Base T.A.', 203.1], ['Charges Pat.', 259.6],
+    ['H. Payées', 326.5], ['H. Sup/Comp Exo', 379.6], ['Mt Sup/Comp Exo', 442.1], ['NET IMPOSABLE', 508.2]]
+    .forEach(([l, x]) => tx(l, x, 737, 7, 'b'))
+  tx('Période', 23, 747.5, 7, 'b'); tx('Année', 23, 757.5, 7, 'b')
+  const cum = d.cumuls || {}
+  const mois = parseFloat(cum.mois) || month + 1
+  const plafondCumul = cum.plafond ?? pmss * mois
+  const hsExoMois = parseFloat(d.montantNetHSExonere) || 0
+  const colR = [119.05, 181.05, 244.05, 307.05, 371.05, 435.05, 500.05, 565.05]
+  const periode = [encNum(d.totalBrut, 2, true), encNum(pmss, 2, true), encNum(Math.min(parseFloat(d.totalBrut) || 0, pmss), 2, true),
+    encNum(d.totalCotisPat, 2, true), encNum(heuresPayees, 3, true), hsExoMois > 0 ? encNum(hs, 3) : '', encNum(hsExoMois), encNum(d.baseIR, 2, true)]
+  const annee = [encNum(cum.brut, 2, true), encNum(plafondCumul, 2, true), encNum(cum.baseTA ?? Math.min(parseFloat(cum.brut) || 0, plafondCumul), 2, true),
+    encNum(cum.cotisPat, 2, true), encNum(cum.heures, 3, true), '', encNum(cum.hsExonere), encNum(cum.netImposable, 2, true)]
+  periode.forEach((v, i) => tx(v, colR[i], 747.5, 7, 'n', 'r'))
+  annee.forEach((v, i) => tx(v, colR[i], 757.5, 7, 'n', 'r'))
+
+  ;[['CONGES', 23, 'l'], ['Dûs', 97, 'r'], ['Acquis', 147, 'r'], ['Pris', 197, 'r'], ['Restant', 247, 'r'], ['Bases', 297, 'r'],
+    ['REPOS', 343, 'l'], ['Dûs', 417, 'r'], ['Acquis', 467, 'r'], ['Pris/Payés', 517, 'r'], ['Restant', 567, 'r']]
+    .forEach(([l, x, al]) => tx(l, x, 772, 7, 'b', al))
+  tx('C.P. N-1', 23, 782, 7, 'b'); tx('C.P. N', 23, 792, 7, 'b')
+  tx('R.T.T.', 343, 782, 7, 'b'); tx('R.C.', 343, 792, 7, 'b')
+  const lv = d.leave
+  if (lv) {
+    // « Pris » ventilé N-1 d'abord puis N — même règle que le moteur et les autres modèles.
+    const prisN1 = Math.min(lv.cpN1Acquis || 0, lv.cumulCongesPris || 0)
+    const prisN = (lv.cumulCongesPris || 0) > (lv.cpN1Acquis || 0) ? lv.cumulCongesPris - lv.cpN1Acquis : 0
+    tx(encNum(lv.cpN1Acquis, 3), 97, 782, 7, 'n', 'r')
+    tx(encNum(prisN1, 3), 197, 782, 7, 'n', 'r')
+    tx(encNum(lv.cpN1Solde, 3), 247, 782, 7, 'n', 'r')
+    tx(encNum(lv.cpNAcquis, 3), 147, 792, 7, 'n', 'r')
+    tx(encNum(prisN, 3), 197, 792, 7, 'n', 'r')
+    tx(encNum(lv.cpNSolde, 3), 247, 792, 7, 'n', 'r')
+    if ((lv.rttAcquis || 0) > 0 || (lv.cumulRttPris || 0) > 0) {
+      tx(encNum(lv.rttAcquis, 3), 467, 782, 7, 'n', 'r')
+      tx(encNum(lv.cumulRttPris, 3), 517, 782, 7, 'n', 'r')
+      tx(encNum(lv.rttSolde, 3, true), 567, 782, 7, 'n', 'r')
+    }
+  }
+
+  tx('DANS VOTRE INTERET ET POUR VOUS AIDER A FAIRE VALOIR VOS DROITS, CONSERVEZ CE BULLETIN DE PAIE SANS LIMITATION DE DUREE.', 84.6, 816, 6)
+  tx('Pour la définition des termes employés, se reporter au site internet service-public.fr rubrique cotisations sociales', 292, 825, 6, 'n', 'c')
+
+  return { w: 595.28, h: 841.89, ops: ops.concat(texts) }
+}
+
+/** Trace `layoutEncadre` avec jsPDF (unité : point). */
+function buildEncadreDoc(JsPDF, data, employerInfo, employeeInfo, month, year, options = {}) {
+  const doc = new JsPDF('p', 'pt', 'a4')
+  patchTradText(doc)
+  const { ops } = layoutEncadre(data, employerInfo, employeeInfo, month, year)
+  const KAPPA = 0.5523
+  ops.forEach((o) => {
+    if (o.k === 'rr') {
+      doc.setDrawColor(0, 0, 0)
+      if (o.lw) doc.setLineWidth(o.lw)
+      if (o.fill != null) doc.setFillColor(o.fill, o.fill, o.fill)
+      doc.roundedRect(o.x, o.y, o.w, o.h, o.r, o.r, o.fill != null ? (o.lw ? 'FD' : 'F') : 'S')
+    } else if (o.k === 'ln') {
+      doc.setDrawColor(0, 0, 0); doc.setLineWidth(o.lw)
+      doc.line(o.x1, o.y1, o.x2, o.y2)
+    } else if (o.k === 'lb') {
+      // Côté gauche, quart de cercle, puis côté bas — le relief des tableaux de l'original.
+      const k = KAPPA * o.r
+      doc.setDrawColor(0, 0, 0); doc.setLineWidth(o.lw)
+      doc.lines([[0, o.y1 - o.r - o.y0], [0, k, o.r - k, o.r, o.r, o.r], [o.x1 - o.x - o.r, 0]], o.x, o.y0, [1, 1], 'S', false)
+    } else if (o.k === 'tx') {
+      doc.setFont('helvetica', o.st === 'b' ? 'bold' : o.st === 'i' ? 'italic' : 'normal')
+      doc.setFontSize(o.size); doc.setTextColor(0, 0, 0)
+      const w = o.al === 'l' ? 0 : doc.getTextWidth(o.s)
+      doc.text(o.s, o.al === 'r' ? o.x - w : o.al === 'c' ? o.x - w / 2 : o.x, o.y)
+    }
+  })
+
+  // Filigrane d'aperçu non payé — même dispositif que les autres modèles
+  // (positions converties des millimètres en points). Inopérant sous Deno.
+  if (options.watermark) {
+    try { doc.setGState(new doc.GState({ opacity: 0.13 })) } catch { /* Deno : ignoré */ }
+    doc.setTextColor(180, 40, 40); doc.setFont('helvetica', 'bold'); doc.setFontSize(30)
+    for (let k = 0; k < 5; k++) doc.text('SPÉCIMEN — NON PAYÉ', 62.36, 170.08 + k * 147.4, { angle: 33 })
+    try { doc.setGState(new doc.GState({ opacity: 1 })) } catch { /* Deno : ignoré */ }
+  }
+  return doc
 }
