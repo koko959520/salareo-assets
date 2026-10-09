@@ -2151,7 +2151,10 @@ export function layoutEncadre(data, employerInfo, employeeInfo, month, year) {
   tx(encNum(heuresPayees, 3, true), 93, 200.6, 9)
   tx(`T : ${encNum(heuresTheo, 3, true)}`, 173, 200.6, 9)
   tx(encNum(pmss, 2, true), 93, 213.6, 9)
-  if (joursPeriode > 0 && joursPeriode < 31) tx(`${joursPeriode} /31`, 173, 213.6, 9)
+  // Jours de présence, seulement pour un mois INCOMPLET (entrée / sortie en cours
+  // de mois). L'original affichait « 28 /31 » pour tout mois de moins de 31 jours,
+  // mention qui fait croire à une proratisation d'un mois complet : retirée.
+  if (d.proration?.partial && joursPeriode > 0) tx(`${joursPeriode} /${daysInMonth}`, 173, 213.6, 9)
 
   const civ = sal.sexe === 'F' ? 'Mme' : sal.sexe === 'M' ? 'M.' : ''
   const nomComplet = [civ, String(sal.nom || '').toUpperCase(), sal.prenom].filter(Boolean).join(' ')
