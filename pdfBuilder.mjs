@@ -71,6 +71,11 @@ export function buildPdfDoc(JsPDF, data, employerInfo, employeeInfo, month, year
   if (template === 'encadre') {
     return buildEncadreDoc(JsPDF, data, employerInfo, employeeInfo, month, year, options)
   }
+  // « colonnes » : en-tête et tableau à colonnes bleus, une page, décrit par
+  // layoutColonnes (même description pour le PDF et l'aperçu écran).
+  if (template === 'colonnes') {
+    return buildColonnesDoc(JsPDF, data, employerInfo, employeeInfo, month, year, options)
+  }
 
   const doc = new JsPDF('p', 'mm', 'a4')
   const pageW = 210
@@ -2296,6 +2301,488 @@ function buildEncadreDoc(JsPDF, data, employerInfo, employeeInfo, month, year, o
 
   // Filigrane d'aperçu non payé — même dispositif que les autres modèles
   // (positions converties des millimètres en points). Inopérant sous Deno.
+  if (options.watermark) {
+    try { doc.setGState(new doc.GState({ opacity: 0.13 })) } catch { /* Deno : ignoré */ }
+    doc.setTextColor(180, 40, 40); doc.setFont('helvetica', 'bold'); doc.setFontSize(30)
+    for (let k = 0; k < 5; k++) doc.text('SPÉCIMEN — NON PAYÉ', 62.36, 170.08 + k * 147.4, { angle: 33 })
+    try { doc.setGState(new doc.GState({ opacity: 1 })) } catch { /* Deno : ignoré */ }
+  }
+  return doc
+}
+
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   MODÈLE « COLONNES » — en-tête bleu, tableau Libellé / Base / Taux / Montant /
+   Charges patronales, une seule page.
+
+   Mise en page des bulletins des logiciels de paie de gestion courante :
+   cadre employeur, titre et période en bleu à droite, identité du salarié en
+   libellés bleus, tableau à bandeau bleu (rubriques en gras, lignes en
+   italique, bandeaux gris des nets), bloc impôt sur le revenu en fin de
+   tableau, puis cumuls période / annuel, net à payer, total versé et congés.
+
+   Relevé le 11/10/2026 sur un bulletin de référence d'une page : géométrie lue
+   DANS LE FLUX PDF (re / m / l / Td / Tf) — colonnes, hauteur de ligne de
+   12,756 pt, bleu (54, 95, 145), gris 192, Helvetica / Bold / Oblique. Nombres
+   au point décimal sans séparateur de milliers, taux à 4 décimales, comme
+   l'original. STRUCTURE uniquement : aucune valeur, aucun nom, aucune marque
+   d'éditeur n'en est reprise.
+
+   Une page garantie : au-delà de 34 lignes, l'interligne et le corps se
+   resserrent ensemble.
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+const COL_BLEU = [54, 95, 145]
+const COL_GRIS = [192, 192, 192]
+const COL_BLANC = [255, 255, 255]
+/** Bords des colonnes du tableau : Libellé | Base | Taux | Montant | Taux pat. | Montant pat. */
+const COL_X = [21.26, 333.071, 385.512, 428.032, 477.638, 520.158, 574.016]
+/** Bords droits des nombres (le texte de l'original s'arrête 0,04 pt avant sa cellule). */
+const COL_R = { base: 383.47, taux: 425.99, amt: 475.6, tpat: 518.12, mpat: 571.98 }
+const COL_TOP = 254.126
+const COL_PITCH = 12.756
+const COL_FIN = 687.83
+const COL_CADRE_BAS = 693.32
+
+/** « 3242.62 », « -214.01 » : point décimal, sans séparateur — '' si nul sauf `keepZero`. */
+function colNum(v, dec = 2, keepZero = false) {
+  const n = parseFloat(v)
+  if (!Number.isFinite(n) || (!keepZero && Math.abs(n) < 0.0005)) return ''
+  return (Math.abs(n) < 0.0005 ? 0 : n).toFixed(dec)
+}
+
+/** Intitulés des lignes de cotisation ; plusieurs lignes du moteur peuvent fusionner en une. */
+const COL_INTITULES = [
+  [/^Sécurité Sociale - Maladie/i, 'Sécurité Sociale - Maladie Maternité Invalidité Décès'],
+  [/^Sécurité Sociale Plafonnée/i, 'Sécurité Sociale plafonnée'],
+  [/^Sécurité Sociale Déplafonnée/i, 'Sécurité Sociale déplafonnée'],
+  [/^(Complémentaire Tranche (A|1)|CEG Tranche 1)\b/i, 'Complémentaire Tranche 1'],
+  [/^(Complémentaire Tranche 2|CEG Tranche 2)\b/i, 'Complémentaire Tranche 2'],
+  [/équilibre technique|\(CET\)/i, 'Complémentaire CET'],
+  [/^(Chômage|AGS)$/i, 'Chômage'],
+  // Intitulés réglementaires du bulletin clarifié (arrêté du 25/02/2016).
+  [/pr[ée]voyance/i, 'Complémentaire Incapacité Invalidité Décès'],
+  [/mutuelle|compl[ée]mentaire sant[ée]|frais de sant[ée]/i, 'Complémentaire Santé'],
+]
+const COL_RANG_RETRAITE = ['Sécurité Sociale plafonnée', 'Sécurité Sociale déplafonnée', 'Complémentaire Tranche 1', 'Complémentaire Tranche 2', 'Complémentaire CET']
+const COL_ORDRE = ['Santé', '__AT__', 'Retraite', 'Famille - Sécurité sociale', 'Assurance chômage', '__AUTRES_INCONNUES__', "Autres contributions dues par l'employeur", 'CSG/CRDS']
+const COL_RUBRIQUES = {
+  'Santé': 'SANTE', 'Retraite': 'RETRAITE', 'Famille - Sécurité sociale': 'FAMILLE',
+  'Assurance chômage': 'ASSURANCE CHOMAGE', "Autres contributions dues par l'employeur": "AUTRES CONTRIBUTIONS DUES PAR L'EMPLOYEUR",
+}
+
+/** Convention applicable : { idcc, name } ou null (régime général / aucune). */
+const CCN_ANCIENNES = { Syntec: 'IDCC1486', HCR: 'IDCC1979' }
+function conventionApplicable(emp) {
+  const conv = CCN_ANCIENNES[emp.convention] || emp.convention || (emp.conventionIdcc ? `IDCC${emp.conventionIdcc}` : 'GENERAL')
+  let idcc = conv === 'CUSTOM'
+    ? String(emp.customConventionIdcc || emp.conventionIdcc || '').replace(/\D/g, '')
+    : String(emp.conventionIdcc || (/^IDCC(\d{1,4})$/.exec(conv) || [])[1] || '').replace(/\D/g, '')
+  if (idcc) idcc = idcc.padStart(4, '0')
+  if (conv === 'GENERAL' || !idcc || idcc === '0000') return null
+  return { idcc, name: String(emp.conventionName || '').trim() }
+}
+
+/**
+ * Description complète de la page (points, origine en haut à gauche, A4).
+ * @returns {{ w: number, h: number, ops: Array<object> }}
+ *   ops : { k:'rect', x,y,w,h, fill:[r,g,b]|null, stroke:[r,g,b]|null, lw }
+ *         { k:'line', x1,y1,x2,y2, lw, col:[r,g,b] }
+ *         { k:'tx', s, x, y, size, st:'n'|'b'|'i', al:'l'|'r'|'c', col:[r,g,b] }
+ */
+export function layoutColonnes(data, employerInfo, employeeInfo, month, year) {
+  const d = data || {}
+  const emp = employerInfo || {}
+  const sal = employeeInfo || {}
+  const ops = []
+  const texts = []
+  const rect = (x, y, w, h, fill, stroke = null, lw = 0.5) => ops.push({ k: 'rect', x, y, w, h, fill, stroke, lw })
+  const line = (x1, y1, x2, y2, lw = 0.5, col = COL_BLEU) => ops.push({ k: 'line', x1, y1, x2, y2, lw, col })
+  const tx = (s, x, y, size, st = 'n', al = 'l', col = [0, 0, 0]) => {
+    const t = s == null ? '' : String(s)
+    if (t.trim()) texts.push({ k: 'tx', s: t, x, y, size, st, al, col })
+  }
+
+  // ── Période et totaux de référence ────────────────────────────────────────
+  const mm = String(month + 1).padStart(2, '0')
+  const daysInMonth = new Date(year, month + 1, 0).getDate()
+  const periodStart = d.proration?.periodeDebut || `01/${mm}/${year}`
+  const periodEnd = d.proration?.periodeFin || `${daysInMonth}/${mm}/${year}`
+  const pmss = parseFloat(d.plafondSS) || ENC_PMSS[year] || 4005
+  const hs = parseFloat(d.heuresSupp) || 0
+  const taux = parseFloat(d.tauxHoraire) || 0
+
+  // ── Lignes du tableau ─────────────────────────────────────────────────────
+  // kind : 'pay' (élément de salaire) | 'head' (rubrique en gras) | 'sub' (ligne
+  // de rubrique, italique) | 'total' | 'band' (bandeau gris) | 'irhead' | 'ir' | 'blank'
+  const rows = []
+  const push = (o) => rows.push(o)
+
+  // Salaire du mois complet, puis absences et entrée/sortie en lignes négatives :
+  // leur somme redonne EXACTEMENT le salaire de base calculé par le moteur.
+  const contrat = parseFloat(d.horaireContractuel ?? d.horaireMensuel) || 0
+  const base = parseFloat(d.salaireBase) || 0
+  const avecAbsences = (d.absencesLignes || []).some((a) => (parseFloat(a.heures) || 0) > 0)
+  // Mois complet sans absence : le salaire de base EST le mensuel (évite une ligne
+  // fantôme à ±0,01 € sur les bulletins enregistrés avant salaireMensuelContractuel).
+  const plein = !d.proration?.partial && !avecAbsences ? base
+    : parseFloat(d.salaireMensuelContractuel) || Math.round(contrat * taux * 100) / 100
+  push({ kind: 'pay', label: `Salaire Mensuel ${contrat.toFixed(3).replace('.', ',')} heures`, amt: plein })
+  const absences = (d.absencesLignes || []).filter((a) => (parseFloat(a.heures) || 0) > 0)
+    .map((a) => {
+      const lib = String(a.label || '').trim()
+      return { kind: 'pay', label: /^absence/i.test(lib) ? lib : `Absence ${lib || 'non rémunérée'}`, base: parseFloat(a.heures), taux, amt: -Math.round(parseFloat(a.heures) * taux * 100) / 100 }
+    })
+  let reste = Math.round((base - plein - absences.reduce((s, a) => s + a.amt, 0)) * 100) / 100
+  if (Math.abs(reste) >= 0.005 && !d.proration?.partial && absences.length) {
+    absences[absences.length - 1].amt = Math.round((absences[absences.length - 1].amt + reste) * 100) / 100
+    reste = 0
+  }
+  absences.forEach(push)
+  if (Math.abs(reste) >= 0.005) push({ kind: 'pay', label: 'Absence Entrée / Sortie, salarié mensuel', amt: reste })
+  if (d.heuresSuppLignes && d.heuresSuppLignes.length > 0) {
+    d.heuresSuppLignes.forEach((l) => {
+      if ((l.heures || 0) > 0) push({ kind: 'pay', label: l.label || `Heures supplémentaires ${l.tauxMult}%`, base: l.heures, taux: l.computedTauxHS, amt: l.brut })
+    })
+  } else if (hs > 0) {
+    push({ kind: 'pay', label: 'Heures supplémentaires', base: hs, taux: d.tauxHS, amt: d.hsBrut })
+  }
+  if (d.primes && d.primes.length > 0) {
+    d.primes.forEach((p) => { if (Math.abs(parseFloat(p.montant) || 0) >= 0.005) push({ kind: 'pay', label: p.label || 'Prime', amt: p.montant }) })
+  } else if (d.primeExceptionnelle > 0) {
+    push({ kind: 'pay', label: 'Prime exceptionnelle', amt: d.primeExceptionnelle })
+  }
+  push({ kind: 'blank' })
+  push({ kind: 'total', label: 'Total Brut', amt: d.totalBrut })
+  push({ kind: 'blank' })
+
+  // Rubriques de cotisations : regroupées et fusionnées comme sur l'original.
+  // Apprenti : le moteur réduit chaque part salariale (art. L.6243-2) en gardant
+  // le taux nominal ; on imprime la part NOMINALE (base × taux) pour que chaque
+  // ligne se vérifie, et l'exonération sur sa propre ligne plus bas.
+  const partSal = (c) => (d.isApprenti && (parseFloat(c.tauxSal) || 0) > 0
+    ? Math.round((parseFloat(c.base) || 0) * (parseFloat(c.tauxSal) || 0)) / 100
+    : parseFloat(c.partSal) || 0)
+  let exoApprenti = 0
+  const valeurs = (c) => {
+    const ps = partSal(c)
+    if (d.isApprenti) exoApprenti += ps - (parseFloat(c.partSal) || 0)
+    return { base: c.base, taux: c.tauxSal, amt: ps > 0 ? -ps : 0, tpat: c.tauxPat, mpat: c.partPat > 0 ? -c.partPat : 0 }
+  }
+  const groupes = new Map()
+  ;(d.cotisations || []).forEach((c) => {
+    const cat = /^accident/i.test(c.name || '') ? '__AT__' : (c.category || '')
+    if (!groupes.has(cat)) groupes.set(cat, [])
+    groupes.get(cat).push(c)
+  })
+  const fusionner = (items) => {
+    const out = []
+    items.forEach((c) => {
+      const regle = COL_INTITULES.find(([re]) => re.test(c.name || ''))
+      const nom = regle ? regle[1] : (c.name || '')
+      const v = valeurs(c)
+      const deja = out.find((o) => o.label === nom && Math.abs((parseFloat(o.base) || 0) - (parseFloat(v.base) || 0)) < 0.005)
+      if (deja) {
+        const r4 = (x) => Math.round(x * 10000) / 10000
+        const r2 = (x) => Math.round(x * 100) / 100
+        deja.taux = r4((parseFloat(deja.taux) || 0) + (parseFloat(v.taux) || 0))
+        deja.amt = r2((deja.amt || 0) + (v.amt || 0))
+        deja.tpat = r4((parseFloat(deja.tpat) || 0) + (parseFloat(v.tpat) || 0))
+        deja.mpat = r2((deja.mpat || 0) + (v.mpat || 0))
+      } else {
+        out.push({ label: nom, ...v })
+      }
+    })
+    return out
+  }
+  const connues = new Set(COL_ORDRE)
+  const ordre = []
+  COL_ORDRE.forEach((cat) => {
+    if (cat === '__AUTRES_INCONNUES__') { for (const k of groupes.keys()) if (!connues.has(k)) ordre.push(k) } else if (groupes.has(cat)) ordre.push(cat)
+  })
+  ordre.forEach((cat) => {
+    const items = groupes.get(cat)
+    if (cat === '__AT__') {
+      items.forEach((c) => push({ kind: 'head', label: 'ACCIDENT DU TRAVAIL-MALADIES PROFESSIONNELLES', ...valeurs(c) }))
+    } else if (cat === 'CSG/CRDS') {
+      items.forEach((c) => {
+        const nom = c.name || ''
+        const label = /non imposable/i.test(nom) ? "CSG déductible de l'impôt sur le revenu"
+          : /imposable/i.test(nom) ? "CSG/CRDS non déductible de l'impôt sur le revenu" : nom
+        push({ kind: 'head', label, ...valeurs(c) })
+      })
+    } else if (cat === "Autres contributions dues par l'employeur") {
+      const total = items.reduce((s, c) => s + (parseFloat(c.partPat) || 0), 0)
+      push({ kind: 'head', label: COL_RUBRIQUES[cat], mpat: total > 0 ? -Math.round(total * 100) / 100 : 0 })
+    } else if (cat === 'Famille - Sécurité sociale' && items.length === 1) {
+      push({ kind: 'head', label: COL_RUBRIQUES[cat], ...valeurs(items[0]) })
+    } else {
+      let lignes = fusionner(items)
+      if (cat === 'Retraite') {
+        const rang = (l) => { const i = COL_RANG_RETRAITE.indexOf(l.label); return i < 0 ? 99 : i }
+        lignes = lignes.map((l, i) => ({ l, i })).sort((a, b) => rang(a.l) - rang(b.l) || a.i - b.i).map((x) => x.l)
+      }
+      push({ kind: 'head', label: COL_RUBRIQUES[cat] || encCaps(cat) })
+      lignes.forEach((l) => push({ kind: 'sub', ...l }))
+    }
+  })
+  const exoSal = parseFloat(d.exoCotisSalHS) || 0
+  const exoApp = Math.round(exoApprenti * 100) / 100
+  const exoPat = Math.round(((parseFloat(d.allegementPatHS) || 0) + (parseFloat(d.reductionGenerale) || 0)) * 100) / 100
+  if (exoPat > 0 || exoSal > 0 || exoApp > 0) {
+    push({ kind: 'head', label: 'EXONERATIONS, ECRETEMENTS ET ALLEGEMENTS DE COTISATIONS', mpat: exoPat > 0 ? exoPat : 0 })
+    if (exoSal > 0) push({ kind: 'pay', label: 'Réduction salariale heures supplémentaires, heures complémentaires', base: d.hsBrut, taux: d.tauxExoSal, amt: exoSal })
+    if (exoApp > 0) push({ kind: 'pay', label: 'Exonération de cotisations salariales apprenti', amt: exoApp })
+  }
+
+  push({ kind: 'blank' })
+  push({ kind: 'total', label: 'Total des cotisations et contributions sociales', amt: -(d.totalCotisSal || 0), mpat: -(d.totalCotisPat || 0) })
+  push({ kind: 'blank' })
+  push({ kind: 'band', label: 'Montant Net social', amt: d.netSocial })
+  push({ kind: 'blank' })
+  push({ kind: 'band', label: 'Net à payer avant impôt', amt: d.netAvantIR })
+  push({ kind: 'blank' })
+  push({ kind: 'irhead' })
+  const cum = d.cumuls || {}
+  push({ kind: 'ir', label: 'Montant net imposable', amt: d.baseIR, keep: true, cumul: cum.netImposable })
+  push({ kind: 'ir', label: 'Montant net des heures compl/suppl exonérées', amt: d.montantNetHSExonere || 0, keep: true, cumul: cum.hsExonere || 0 })
+  push({ kind: 'ir', label: `Impôt sur le revenu prélevé à la source (taux d'imposition ${d.irAuto === false ? 'personnalisé' : 'calculé selon barème'})`,
+    base: d.baseIR, taux: d.tauxIR, tauxKeep: true, amt: -(d.irPreleve || 0), keep: true, cumul: cum.irPreleve || 0 })
+
+  // ── Pas de ligne et corps : 34 lignes à 12,756 pt, resserrées au-delà ─────
+  const pitch = rows.length > 0 ? Math.min(COL_PITCH, (COL_FIN - COL_TOP) / rows.length) : COL_PITCH
+  const sc = pitch / COL_PITCH
+  const fs = Math.max(5.5, 7.999 * sc)
+  const fsBand = Math.max(6, 8.999 * sc)
+  const yTop = (i) => COL_TOP + i * pitch
+
+  // ── Cadres et bandeaux ────────────────────────────────────────────────────
+  // Cadre employeur
+  line(21.39, 28.47, 269.29, 28.47, 0.25); line(21.39, 28.47, 21.39, 110.55, 0.25)
+  line(21.39, 110.55, 269.29, 110.55); line(269.29, 28.47, 269.29, 110.55)
+  // Bandeau des colonnes
+  rect(COL_X[0], 237.118, COL_X[6] - COL_X[0], 17.008, COL_BLEU)
+  ;[1, 2, 3, 4].forEach((i) => line(COL_X[i], 237.12, COL_X[i], 254.13, 0.5, COL_BLANC))
+  // Bandeaux gris (nets, en-tête impôt) et leurs filets
+  const coupures = []
+  rows.forEach((r, i) => {
+    if (r.kind !== 'band' && r.kind !== 'irhead') return
+    rect(COL_X[0], yTop(i), COL_X[6] - COL_X[0], pitch, COL_GRIS)
+    line(COL_X[0], yTop(i), COL_X[6], yTop(i)); line(COL_X[0], yTop(i + 1), COL_X[6], yTop(i + 1))
+    if (r.kind === 'band') coupures.push([yTop(i), yTop(i + 1)])
+  })
+  const fin = rows.length ? yTop(rows.length) : COL_FIN
+  line(COL_X[0], fin, COL_X[6], fin)
+  // Bas du cadre : ligne de remplissage de 5,49 pt sous la dernière ligne, comme
+  // l'original (680,56 à 33 lignes, 693,32 à 34) ; jamais plus haut que 680,56.
+  const bas = Math.min(COL_CADRE_BAS, Math.max(fin + 5.491, 680.562))
+  // Filets verticaux : interrompus sur les bandeaux des nets ; aucun dans « Charges patronales ».
+  ;[1, 2, 3, 4].forEach((i) => {
+    let y0 = COL_TOP
+    coupures.forEach(([a, b]) => { if (a > y0) line(COL_X[i], y0, COL_X[i], a); y0 = b })
+    line(COL_X[i], y0, COL_X[i], bas)
+  })
+  // Cadre du corps
+  line(21.39, 254.25, 573.89, 254.25, 0.25); line(21.39, 254.25, 21.39, bas, 0.25)
+  line(21.39, bas, 573.89, bas, 0.25); line(573.89, 254.25, 573.89, bas, 0.25)
+
+  // ── En-tête ───────────────────────────────────────────────────────────────
+  const raison = emp.raisonSociale || emp.nom || ''
+  tx(encClip(raison, 9, 236), 28.96, 44.19, 9)
+  tx(encClip(emp.adresse, 9, 236), 28.96, 58.3, 9)
+  tx(encClip([emp.codePostal, emp.ville].filter(Boolean).join(' '), 9, 236), 28.96, 86.67, 9)
+  const siret = String(emp.siret || '').replace(/\s/g, '')
+  tx(encClip(`SIRET : ${siret}${emp.codeAPE ? `    APE : ${emp.codeAPE}` : ''}`, 9, 236), 28.96, 100.85, 9)
+
+  const centre = 346.77 + encW('BULLETIN DE PAIE', 19, true) / 2
+  tx('BULLETIN DE PAIE', centre, 48.94, 19, 'b', 'c', COL_BLEU)
+  tx(`Période du ${periodStart} au ${periodEnd}`, centre, 70.11, 10, 'n', 'c', COL_BLEU)
+  const mode = String(d.modePaiement || emp.modePaiement || 'Virement').replace(/\s*bancaire$/i, '')
+  tx(`Paiement, le ${periodEnd} par ${mode.charAt(0).toUpperCase()}${mode.slice(1).toLowerCase()}`, centre, 87.1, 10, 'n', 'c', COL_BLEU)
+
+  ;[['Code :', 123.53, sal.matricule], ['N° Sécurité soc. :', 134.84, String(sal.numSecu || '').replace(/\s/g, '')],
+    ['Emploi :', 146.21, sal.emploi], ['Niveau :', 157.51, sal.niveau], ['Coefficient :', 168.89, sal.coefficient],
+    ['Indice :', 180.19, sal.echelon], ['Ancienneté :', 191.5, formatDateFR(sal.dateEntree)]].forEach(([l, y, v]) => {
+    tx(l, 23.28, y, 8, 'n', 'l', COL_BLEU)
+    tx(encClip(v, 8, 190), 97.8, y, 8)
+  })
+
+  const sexe = String(sal.sexe || '')
+  const civ = sexe === '2' || sexe === 'F' ? 'Mme' : sexe === '1' || sexe === 'M' ? 'M.' : ''
+  const nomComplet = [civ, String(sal.nom || '').toUpperCase(), String(sal.prenom || '').toUpperCase()].filter(Boolean).join(' ')
+  tx(encClip(nomComplet, 10, 262), 308.11, 137.64, 10)
+  tx(encClip(sal.adresse, 10, 262), 308.11, 154.63, 10)
+  tx(encClip([sal.codePostal, sal.ville].filter(Boolean).join(' '), 10, 262), 308.11, 188.69, 10)
+
+  // Convention collective (art. R.3243-1, 3°) ; l'IDCC reste toujours lisible, seul
+  // l'intitulé est raccourci s'il déborde. Aucune convention → Code du travail.
+  const cv = conventionApplicable(emp)
+  if (cv) {
+    const suffixe = ` (IDCC N°${cv.idcc})`
+    const tete = 'Convention collective : '
+    const sCcn = encFit(`${tete}${cv.name}${suffixe}`, 9, 550, false, 6.5)
+    const nom = cv.name ? encClip(cv.name, sCcn, 550 - encW(tete + suffixe, sCcn)) : ''
+    tx(nom ? `${tete}${nom}${suffixe}` : `${tete}IDCC N°${cv.idcc}`, 23.28, 233.12, sCcn)
+  } else {
+    tx('Convention collective : aucune (Code du travail)', 23.28, 233.12, 9)
+  }
+
+  // ── Tableau ───────────────────────────────────────────────────────────────
+  ;[['Libellé', 0, 1], ['Base', 1, 2], ['Taux', 2, 3], ['Montant', 3, 4], ['Charges patronales', 4, 6]]
+    .forEach(([l, a, b]) => tx(l, (COL_X[a] + COL_X[b]) / 2, 248.74, 9, 'b', 'c', COL_BLANC))
+
+  const cellules = (r, y) => {
+    tx(colNum(r.base), COL_R.base, y, fs, 'n', 'r')
+    tx(colNum(r.taux, 4, r.tauxKeep), COL_R.taux, y, fs, 'n', 'r')
+    tx(colNum(r.amt, 2, r.keep), COL_R.amt, y, fs, 'n', 'r')
+    if (r.kind === 'ir') tx(colNum(r.cumul, 2, true), COL_R.mpat, y, fs, 'n', 'r')
+    else {
+      tx(colNum(r.tpat, 4), COL_R.tpat, y, fs, 'n', 'r')
+      tx(colNum(r.mpat), COL_R.mpat, y, fs, 'n', 'r')
+    }
+  }
+  const maxLib = COL_X[1] - COL_X[0] - 4
+  rows.forEach((r, i) => {
+    const y = yTop(i) + 9.284 * sc
+    if (r.kind === 'blank') return
+    if (r.kind === 'band') {
+      tx(r.label, 23.28, yTop(i) + 10.13 * sc, fsBand, 'b')
+      tx(colNum(r.amt, 2, true), COL_R.mpat, yTop(i) + 10.13 * sc, fsBand, 'b', 'r')
+      return
+    }
+    if (r.kind === 'irhead') {
+      const yh = yTop(i) + 9.15 * sc
+      ;[['Impôt sur le revenu', 0, 1], ['Base', 1, 2], ['Taux', 2, 3], ['Montant', 3, 4], ['Cumul annuel', 4, 6]]
+        .forEach(([l, a, b]) => tx(l, (COL_X[a] + COL_X[b]) / 2, yh, fs, 'n', 'c'))
+      return
+    }
+    const st = r.kind === 'head' ? 'b' : r.kind === 'sub' ? 'i' : 'n'
+    const x = r.kind === 'sub' ? 27.72 : r.kind === 'total' ? 45.52 : 23.28
+    tx(encClip(r.label, fs, maxLib - (x - 23.28), st === 'b'), x, y, fs, st)
+    cellules(r, y)
+  })
+
+  // ── Pied : cumuls, net à payer, total versé, congés ───────────────────────
+  const cumX = [[21.26, 31.206], [52.466, 42.52], [95.091, 42.52], [137.575, 42.52], [180.237, 42.52],
+    [222.913, 42.52], [265.688, 42.52], [308.575, 42.52], [351.078, 42.52]]
+  const entetes = ['Cumuls', 'Plafond SS', 'Brut', 'Brut abattu', 'Cotis. Sal.', 'Cotis. Pat.', 'Hres Trav.', 'Hres Pay.', 'Hres Supp.']
+  cumX.forEach(([x, w], i) => {
+    rect(x, 715.048, w, 12.756, COL_BLEU)
+    line(x + w, 715.05, x + w, 727.8, 0.5, COL_BLANC)
+    tx(entetes[i], x + w / 2, 723.41, 7, 'n', 'c', COL_BLANC)
+  })
+  ;[[728.568, 'Période', 736.88], [742.424, 'Annuel', 750.77]].forEach(([y, l, yb]) => {
+    rect(21.26, y, 31.206, 12.756, COL_BLEU)
+    tx(l, 21.26 + 31.206 / 2, yb, 7, 'n', 'c', COL_BLANC)
+    cumX.slice(1).forEach(([x, w]) => {
+      line(x, y, x, y + 12.756); line(x, y + 12.756, x + w, y + 12.756); line(x + w, y, x + w, y + 12.756)
+    })
+  })
+  const heuresPay = (parseFloat(d.horaireMensuel) || 0) + hs
+  const periode = [pmss, d.totalBrut, d.totalBrut, d.totalCotisSal, d.totalCotisPat]
+  // Bulletins enregistrés avant ces cumuls : case laissée vide plutôt qu'une valeur reconstituée.
+  const annuel = [cum.plafond, cum.brut, cum.brut, cum.cotisSal, cum.cotisPat]
+  const heuresP = [heuresPay, heuresPay, hs]
+  const heuresA = [cum.heures, cum.heures, cum.heuresSupp]
+  cumX.slice(1).forEach(([x, w], i) => {
+    const vP = i < 5 ? colNum(periode[i], 2, true) : colNum(heuresP[i - 5], 3, true)
+    const brutA = i < 5 ? annuel[i] : heuresA[i - 5]
+    const vA = brutA == null ? '' : i < 5 ? colNum(brutA, 2, true) : colNum(brutA, 3, true)
+    tx(vP, x + w - 1.99, 736.88, 7, 'n', 'r')
+    tx(vA, x + w - 1.99, 750.77, 7, 'n', 'r')
+  })
+
+  // Montant total des exonérations et allègements de cotisations (art. R.3243-1, 13°),
+  // mois et cumul annuel — même gabarit que les cases des cumuls.
+  rect(21.26, 758.268, 116.315, 11.339, COL_BLEU)
+  tx('Allègements de cotisations', 24.5, 766.6, 7, 'n', 'l', COL_BLANC)
+  ;[[137.575, d.totalAllegements], [180.237, cum.allegements]].forEach(([x, v], i) => {
+    rect(x, 758.268, 42.52, 11.339, null, COL_BLEU, 0.5)
+    tx(v == null && i === 1 ? '' : colNum(v || 0, 2, true), x + 42.52 - 1.99, 766.6, 7, 'n', 'r')
+  })
+  tx('Mois', 158.835, 775.9, 6, 'n', 'c', COL_BLEU); tx('Année', 201.497, 775.9, 6, 'n', 'c', COL_BLEU)
+
+  rect(396.851, 704.977, 90.709, 19.559, COL_BLEU)
+  tx('Net à payer', 396.851 + 90.709 / 2, 717.08, 10, 'b', 'c', COL_BLANC)
+  rect(487.56, 705.26, 86.21, 19.84, null, COL_BLEU, 1)
+  tx(colNum(d.netAPayer, 2, true), 571.98, 717.37, 10, 'b', 'r')
+  rect(396.851, 725.669, 90.709, 11.339, COL_BLEU)
+  tx("Total versé par l'employeur", 400.12, 734, 7, 'n', 'l', COL_BLANC)
+  rect(487.56, 725.67, 86.33, 11.34, null, COL_BLEU, 0.5)
+  tx(colNum(d.totalVerseEmployeur, 2, true), 572.02, 734, 7, 'n', 'r')
+
+  const cgX = [[396.598, 75.118], [471.717, 34.016], [505.732, 34.016], [539.748, 34.016]]
+  ;['Congés', 'Acquis', 'Pris', 'Reste'].forEach((l, i) => {
+    const [x, w] = cgX[i]
+    rect(x, 739.008, w, 11.339, COL_BLEU)
+    if (i > 0) line(x, 739.13, x, 750.35, 0.5, COL_BLANC)
+    tx(l, x + w / 2, 747.46, 8, 'n', 'c', COL_BLANC)
+  })
+  const lv = d.leave || {}
+  const prisN1 = Math.min(lv.cpN1Acquis || 0, lv.cumulCongesPris || 0)
+  const prisN = (lv.cumulCongesPris || 0) > (lv.cpN1Acquis || 0) ? lv.cumulCongesPris - lv.cpN1Acquis : 0
+  const conges = [
+    ['CP année N', lv.cpNAcquis, prisN, lv.cpNSolde],
+    ['CP année N-1', lv.cpN1Acquis, prisN1, lv.cpN1Solde],
+    ['RTT', lv.rttAcquis, lv.cumulRttPris, lv.rttSolde],
+    ['Repos comp.', null, null, null],
+  ]
+  conges.forEach(([l, ...v], k) => {
+    const y = 750.35 + k * 11.339
+    cgX.forEach(([x, w]) => { line(x, y + 11.339, x + w, y + 11.339); line(x + w, y, x + w, y + 11.339) })
+    line(396.72, y, 396.72, y + 11.339, 0.25)
+    tx(l, 398.61, y + 8.42, 8)
+    v.forEach((val, i) => tx(val == null ? '' : colNum(val || 0, 2, true), cgX[i + 1][0] + cgX[i + 1][1] - 1.98, y + 8.42, 8, 'n', 'r'))
+  })
+
+  tx('Pour vous aider à faire valoir vos droits, conservez ce bulletin de paie sans limitation de durée.', 21.26, 817.66, 7, 'n', 'l', COL_BLEU)
+  tx('Pour la définition des termes employés, se reporter au site internet service-public.fr rubrique cotisations sociales.', 21.26, 825.51, 7, 'n', 'l', COL_BLEU)
+
+  return { w: 595.28, h: 841.89, ops: ops.concat(texts) }
+}
+
+/** Trace les primitives des modèles « décrits » (encadré, colonnes) avec jsPDF. */
+function traceOps(doc, ops) {
+  const KAPPA = 0.5523
+  ops.forEach((o) => {
+    if (o.k === 'rr') {
+      doc.setDrawColor(0, 0, 0)
+      if (o.lw) doc.setLineWidth(o.lw)
+      if (o.fill != null) doc.setFillColor(o.fill, o.fill, o.fill)
+      doc.roundedRect(o.x, o.y, o.w, o.h, o.r, o.r, o.fill != null ? (o.lw ? 'FD' : 'F') : 'S')
+    } else if (o.k === 'ln') {
+      doc.setDrawColor(0, 0, 0); doc.setLineWidth(o.lw)
+      doc.line(o.x1, o.y1, o.x2, o.y2)
+    } else if (o.k === 'lb') {
+      const k = KAPPA * o.r
+      doc.setDrawColor(0, 0, 0); doc.setLineWidth(o.lw)
+      doc.lines([[0, o.y1 - o.r - o.y0], [0, k, o.r - k, o.r, o.r, o.r], [o.x1 - o.x - o.r, 0]], o.x, o.y0, [1, 1], 'S', false)
+    } else if (o.k === 'rect') {
+      if (o.fill) doc.setFillColor(o.fill[0], o.fill[1], o.fill[2])
+      if (o.stroke) { doc.setDrawColor(o.stroke[0], o.stroke[1], o.stroke[2]); doc.setLineWidth(o.lw || 0.5) }
+      doc.rect(o.x, o.y, o.w, o.h, o.fill && o.stroke ? 'FD' : o.fill ? 'F' : 'S')
+    } else if (o.k === 'line') {
+      const c = o.col || [0, 0, 0]
+      doc.setDrawColor(c[0], c[1], c[2]); doc.setLineWidth(o.lw)
+      doc.line(o.x1, o.y1, o.x2, o.y2)
+    } else if (o.k === 'tx') {
+      const c = o.col || [0, 0, 0]
+      doc.setFont('helvetica', o.st === 'b' ? 'bold' : o.st === 'i' ? 'italic' : 'normal')
+      doc.setFontSize(o.size); doc.setTextColor(c[0], c[1], c[2])
+      // Largeurs AFM (celles qu'applique le lecteur PDF), pas getTextWidth (table
+      // arrondie + crénage) : alignements identiques à l'original et à l'aperçu.
+      const w = o.al === 'l' ? 0 : encW(o.s, o.size, o.st === 'b')
+      doc.text(o.s, o.al === 'r' ? o.x - w : o.al === 'c' ? o.x - w / 2 : o.x, o.y)
+    }
+  })
+}
+
+/** Trace `layoutColonnes` avec jsPDF (unité : point). */
+function buildColonnesDoc(JsPDF, data, employerInfo, employeeInfo, month, year, options = {}) {
+  const doc = new JsPDF('p', 'pt', 'a4')
+  patchTradText(doc)
+  traceOps(doc, layoutColonnes(data, employerInfo, employeeInfo, month, year).ops)
+  // Filigrane d'aperçu non payé — même dispositif que les autres modèles. Inopérant sous Deno.
   if (options.watermark) {
     try { doc.setGState(new doc.GState({ opacity: 0.13 })) } catch { /* Deno : ignoré */ }
     doc.setTextColor(180, 40, 40); doc.setFont('helvetica', 'bold'); doc.setFontSize(30)
