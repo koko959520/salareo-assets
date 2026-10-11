@@ -48,6 +48,57 @@ function formatDateFR(value) {
 }
 
 /**
+ * Congés payés pris dans le mois (art. R.3243-1 12° : le bulletin mentionne les
+ * dates de congé et le montant de l'indemnité). Absence = retenue au maintien ;
+ * indemnité = maintien, ou dixième s'il est plus favorable (l'écart est dans le
+ * brut du moteur) — la somme des lignes de gains retombe sur le brut. `absence` /
+ * `absenceCourt` = libellé long / pour les colonnes étroites. null si rien à
+ * imprimer (bulletins enregistrés avant le 11/10/2026 compris).
+ */
+export function lignesCongesPayes(data) {
+  const cp = data && data.congesPayes
+  const jours = parseFloat(cp && cp.jours) || 0
+  const montant = Math.round((parseFloat(cp && cp.montant) || 0) * 100) / 100
+  if (!cp || jours <= 0 || montant <= 0) return null
+  // Retenue d'absence = maintien ; l'indemnité peut la dépasser (règle du
+  // dixième, complément intégré au brut). Bulletins d'avant : retenue = montant.
+  const retenue = Math.round((parseFloat(cp.retenue) || montant) * 100) / 100
+  const d = formatDateFR(cp.debut)
+  const f = formatDateFR(cp.fin)
+  let periode = ''
+  if (d && f) periode = d === f ? ` le ${d}` : ` du ${d.slice(6) === f.slice(6) ? d.slice(0, 5) : d} au ${f}`
+  else if (d) periode = ` à partir du ${d}`
+  else if (f) periode = ` jusqu'au ${f}`
+  return {
+    jours, montant, retenue,
+    absence: `Absence congés payés${periode}`,
+    absenceCourt: `Absence CP${periode}`,
+    indemnite: montant > retenue ? 'Indemnité de congés payés (1/10e)' : 'Indemnité de congés payés',
+  }
+}
+
+/**
+ * La CSG/CRDS sur les parts patronales de prévoyance / santé (lignes `surPSC`
+ * du moteur, montant calculé PAR DIFFÉRENCE avec la ligne principale) est
+ * imprimée DANS la ligne CSG correspondante, dans TOUS les modèles : assiette =
+ * 98,25 % du brut + parts patronales, base × taux = montant au centime. Imprimée
+ * seule, une ligne calculée par différence pouvait afficher 17,84 × 2,9 % = 0,51
+ * (relevé le 11/10/2026).
+ */
+export function fusionCsgPsc(cotisations) {
+  const r2 = (x) => Math.round(x * 100) / 100
+  const out = []
+  ;(cotisations || []).forEach((c) => {
+    if (!c.surPSC) { out.push({ ...c }); return }
+    const cible = out.find((o) => o.isCSG && !o.surPSC && !!o.isImposable === !!c.isImposable)
+    if (!cible) { out.push({ ...c }); return }
+    cible.base = r2((parseFloat(cible.base) || 0) + (parseFloat(c.base) || 0))
+    cible.partSal = r2((parseFloat(cible.partSal) || 0) + (parseFloat(c.partSal) || 0))
+  })
+  return out
+}
+
+/**
  * Constructeur du bulletin PDF. Reçoit le constructeur jsPDF (`JsPDF`) pour rester
  * isomorphe. `options.watermark = true` appose un filigrane SPÉCIMEN (aperçu non payé).
  * @returns instance jsPDF (non sauvegardée)
@@ -76,6 +127,7 @@ export function buildPdfDoc(JsPDF, data, employerInfo, employeeInfo, month, year
   if (template === 'colonnes') {
     return buildColonnesDoc(JsPDF, data, employerInfo, employeeInfo, month, year, options)
   }
+  const cotisAffichees = fusionCsgPsc(data.cotisations)
 
   const doc = new JsPDF('p', 'mm', 'a4')
   const pageW = 210
@@ -362,11 +414,12 @@ export function buildPdfDoc(JsPDF, data, employerInfo, employeeInfo, month, year
     if (data.primes && data.primes.length > 0)
       primeCount = data.primes.filter(p => (p.montant || 0) > 0).length
     else if (data.primeExceptionnelle > 0) primeCount = 1
+    if (lignesCongesPayes(data)) primeCount += 2
     let catCount = 0, prevCat = null
-    data.cotisations.forEach(c => { if (c.category !== prevCat) { catCount++; prevCat = c.category } })
+    cotisAffichees.forEach(c => { if (c.category !== prevCat) { catCount++; prevCat = c.category } })
     const hasAlleg = data.exoCotisSalHS > 0 || data.reductionGenerale > 0
     const allegDataRows = (data.reductionGenerale > 0 ? 1 : 0) + (data.exoCotisSalHS > 0 ? 2 : 0)
-    const rowUnits = 1 + hsCount + primeCount + 1 + data.cotisations.length + allegDataRows + 1 + 1
+    const rowUnits = 1 + hsCount + primeCount + 1 + cotisAffichees.length + allegDataRows + 1 + 1
     const catUnits = catCount + (hasAlleg ? 1 : 0)
     const body = rowUnits * ROW_H + catUnits * CAT_H + NET_H + DISC_H   // dense ≈ 166
 
@@ -538,6 +591,12 @@ export function buildPdfDoc(JsPDF, data, employerInfo, employeeInfo, month, year
     ])
   }
 
+  const cpClassic = lignesCongesPayes(data)
+  if (cpClassic) {
+    drawPdfRow([cpClassic.absence, `${formatMontant(cpClassic.jours)} j`, '-', formatMontant(-cpClassic.retenue), '-'])
+    drawPdfRow([cpClassic.indemnite, `${formatMontant(cpClassic.jours)} j`, '-', formatMontant(cpClassic.montant), '-'])
+  }
+
   // TOTAL BRUT
   drawPdfRow([
     'Rémunération brute  (1)', '-', '-',
@@ -547,7 +606,7 @@ export function buildPdfDoc(JsPDF, data, employerInfo, employeeInfo, month, year
 
   // Cotisations
   let currentCat = null
-  data.cotisations.forEach((c) => {
+  cotisAffichees.forEach((c) => {
     if (c.category !== currentCat) {
       currentCat = c.category
       // Draw category title row
@@ -1075,12 +1134,17 @@ function buildTraditionnelDoc(JsPDF, data, employerInfo, employeeInfo, month, ye
   } else if (data.primeExceptionnelle > 0) {
     item({ label: 'Prime exceptionnelle', salAmt: data.primeExceptionnelle })
   }
+  const cpTrad = lignesCongesPayes(data)
+  if (cpTrad) {
+    item({ label: cpTrad.absenceCourt, base: cpTrad.jours, salAmt: -cpTrad.retenue })
+    item({ label: cpTrad.indemnite, base: cpTrad.jours, salAmt: cpTrad.montant })
+  }
 
   item({ label: 'Total Brut', salAmt: data.totalBrut, bold: true })
   gap()
 
   let cat = null
-  ;(data.cotisations || []).forEach((c) => {
+  fusionCsgPsc(data.cotisations).forEach((c) => {
     if (c.category !== cat) { cat = c.category; rows.push({ kind: 'cat', label: c.category }) }
     item({
       label: c.name, sub: true,
@@ -1324,10 +1388,10 @@ function buildTraditionnelDoc(JsPDF, data, employerInfo, employeeInfo, month, ye
       const cum = data.cumuls || {}
       mono(6.4); ink([0, 0, 0])
       // Le `null` en 5e position = colonne « BRUT CONGES PAYES ». Elle reste
-      // VIDE à dessein : la rémunération est mensualisée (maintien de salaire
-      // pendant les congés), le moteur ne produit donc aucune indemnité de
-      // congés payés distincte à y reporter. Y écrire un montant reviendrait à
-      // inventer une donnée. Les compteurs en JOURS sont affichés plus haut.
+      // VIDE : l'indemnité du mois est imprimée dans le corps (lignes « Absence
+      // CP » / « Indemnité de congés payés », depuis le 11/10/2026) mais le
+      // moteur n'en tient pas de cumul annuel — n'afficher que le mois serait
+      // incohérent avec la ligne CUMUL. Compteurs en JOURS plus haut.
       const mois = [data.totalBrut, data.totalCotisSal, data.totalCotisPat, data.baseIR, null, data.totalAllegements, data.totalVerseEmployeur]
       const cumul = [cum.brut, cum.cotisSal, cum.cotisPat, cum.netImposable, null, cum.allegements, cum.totalVerse]
       mois.forEach((v, i) => { if (v != null) right(fmtTrad(v, true), xs[i + 1] - 1.5, r1y + 3.7) })
@@ -1420,9 +1484,11 @@ export function joursFeries(year) {
  * heures : on affiche donc l'horaire contractuel réparti du lundi au vendredi
  * (horaire mensuel × 12 / 52 / 5 — 7,00 h/j pour 151,67 h), rien le week-end,
  * « JF » sur les jours fériés légaux tombant en semaine (jour férié chômé),
- * et rien hors période de présence (entrée/sortie en cours de mois). Les
- * congés et absences saisis sur le bulletin n'ont pas de dates : ils ne sont
- * PAS reportés ici — plutôt que de les placer sur des jours inventés.
+ * et rien hors période de présence (entrée/sortie en cours de mois). Depuis le
+ * 11/10/2026, les congés payés datés (`opts.congesDebut/congesFin`, ISO) sont
+ * marqués « CP » et les absences non rémunérées DATÉES (`opts.absences`,
+ * debut/fin) « AB » sur leurs jours ouvrés ; une absence sans dates n'est pas
+ * reportée — plutôt que de la placer sur des jours inventés.
  */
 export function calendrierMois(year, month, horaireMensuel, opts = {}) {
   const feries = joursFeries(year)
@@ -1441,8 +1507,15 @@ export function calendrierMois(year, month, horaireMensuel, opts = {}) {
     const present = (debut == null || t >= debut) && (fin == null || t <= fin)
     const weekend = dow === 0 || dow === 6
     let heures = 0, incident = '', heuresIncident = 0
+    const enConges = !!(opts.congesDebut && opts.congesFin) && key >= String(opts.congesDebut).slice(0, 10) && key <= String(opts.congesFin).slice(0, 10)
+    // Absence non rémunérée DATÉE (retenue sur le salaire) : jour en incident « AB »,
+    // pas en heures de travail.
+    const enAbsence = (opts.absences || []).some((a) => (parseFloat(a.heures) || 0) > 0 && a.debut && a.fin
+      && key >= String(a.debut).slice(0, 10) && key <= String(a.fin).slice(0, 10))
     if (present && !weekend) {
       if (feries.has(key)) { incident = 'JF'; heuresIncident = hJour } // férié chômé payé : la journée est comptée en incident
+      else if (enConges) { incident = 'CP'; heuresIncident = hJour }
+      else if (enAbsence) { incident = 'AB'; heuresIncident = hJour }
       else heures = hJour
     }
     out.push({ jour: d, lettre: LETTRES[dow], heures, incident, heuresIncident })
@@ -1639,9 +1712,12 @@ function buildCabinetDoc(JsPDF, data, employerInfo, employeeInfo, month, year, o
   const item = (o) => rows.push({ kind: 'item', ...o })
 
   item({ label: 'SALAIRE DE BASE', base: data.horaireMensuel, salAmt: data.salaireBase })
+  // Absences : le salaire de base du moteur est DÉJÀ calculé sur les heures
+  // payées — ligne indicative en heures, sans montant (avant le 11/10/2026 elle
+  // portait −heures × taux : absence déduite deux fois à l'affichage).
   ;(data.absencesLignes || []).forEach((a) => {
     if ((a.heures || 0) > 0) {
-      item({ label: `ABS. ${capsCab(a.label || 'ABSENCE')}`, base: a.heures, taux: data.tauxHoraire, salAmt: -(a.heures * (parseFloat(data.tauxHoraire) || 0)) })
+      item({ label: `ABS. ${capsCab(a.label || 'ABSENCE')}`, base: a.heures })
     }
   })
   if (data.heuresSuppLignes && data.heuresSuppLignes.length > 0) {
@@ -1656,13 +1732,18 @@ function buildCabinetDoc(JsPDF, data, employerInfo, employeeInfo, month, year, o
   } else if (data.primeExceptionnelle > 0) {
     item({ label: 'PRIME EXCEPTIONNELLE', salAmt: data.primeExceptionnelle })
   }
+  const cpCab = lignesCongesPayes(data)
+  if (cpCab) {
+    item({ label: capsCab(cpCab.absenceCourt), base: cpCab.jours, salAmt: -cpCab.retenue })
+    item({ label: capsCab(cpCab.indemnite), base: cpCab.jours, salAmt: cpCab.montant })
+  }
   rows.push({ kind: 'total', label: '*REMUNERATION BRUTE.(1)', col: 'sal', value: data.totalBrut })
 
   // Cotisations, regroupées par rubrique. Une rubrique à ligne unique est
   // portée par sa propre ligne (comme FAMILLE / ASSURANCE CHOMAGE sur
   // l'original) ; à plusieurs lignes, en-tête gras puis lignes en retrait.
   const groups = []
-  ;(data.cotisations || []).forEach((c) => {
+  fusionCsgPsc(data.cotisations).forEach((c) => {
     const last = groups[groups.length - 1]
     if (last && last.category === c.category) last.items.push(c)
     else groups.push({ category: c.category, items: [c] })
@@ -1774,7 +1855,7 @@ function buildCabinetDoc(JsPDF, data, employerInfo, employeeInfo, month, year, o
   rule(kx0, gy + 11.6, kx1, gy + 11.6)
   rule(kJour + 2, gy + 7.6, kJour + 2, gy + 11.6); rule(kTrav + 0.5, gy + 7.6, kTrav + 0.5, gy + 11.6)
 
-  const cal = calendrierMois(year, month, hm, { presenceStart: data.proration?.presenceStart, presenceEnd: data.proration?.presenceEnd })
+  const cal = calendrierMois(year, month, hm, { presenceStart: data.proration?.presenceStart, presenceEnd: data.proration?.presenceEnd, congesDebut: data.congesPayes?.debut, congesFin: data.congesPayes?.fin, absences: data.absencesLignes })
   const kSize = 6
   const kLine = Math.min(3.0, (CAB.BODY_BOTTOM - (gy + 13)) / Math.max(28, cal.length))
   const kIncNum = kTrav + 9 // bord droit du nombre d'heures d'incident
@@ -1877,6 +1958,8 @@ function buildCabinetDoc(JsPDF, data, employerInfo, employeeInfo, month, year, o
   rule(kx0, cy, kx1, cy)
   mono(6.2); ink(CAB_INK)
   doc.text('JF J.FERIE CHOME PAYE', kx0 + 1.5, cy + 4.5)
+  if (cal.some((d) => d.incident === 'CP')) doc.text('CP CONGES PAYES', kx0 + 1.5, cy + 7.5)
+  if (cal.some((d) => d.incident === 'AB')) doc.text('AB ABSENCE NON REMUNEREE', kx0 + 1.5, cy + (cal.some((d) => d.incident === 'CP') ? 10.5 : 7.5))
 
   // ═══ PIED ═══════════════════════════════════════════════════════════════════
   sans(5.4); ink(CAB_INK)
@@ -2046,11 +2129,16 @@ export function layoutEncadre(data, employerInfo, employeeInfo, month, year) {
   } else if (d.primeExceptionnelle > 0) {
     line({ label: 'Prime exceptionnelle', amt: d.primeExceptionnelle })
   }
+  const cpEnc = lignesCongesPayes(d)
+  if (cpEnc) {
+    line({ label: cpEnc.absence, base: cpEnc.jours, amt: -cpEnc.retenue })
+    line({ label: cpEnc.indemnite, base: cpEnc.jours, amt: cpEnc.montant })
+  }
   rows.push({ kind: 'band', label: 'Total brut', amt: d.totalBrut })
 
   // Rubriques de cotisations, dans l'ordre de l'original.
   const groupes = new Map()
-  ;(d.cotisations || []).forEach((c) => {
+  fusionCsgPsc(d.cotisations).forEach((c) => {
     let cat = c.category || ''
     if (/^accident/i.test(c.name || '')) cat = '__AT__'
     if (!groupes.has(cat)) groupes.set(cat, [])
@@ -2235,7 +2323,7 @@ export function layoutEncadre(data, employerInfo, employeeInfo, month, year) {
   const plafondCumul = cum.plafond ?? pmss * mois
   const hsExoMois = parseFloat(d.montantNetHSExonere) || 0
   const colR = [119.05, 181.05, 244.05, 307.05, 371.05, 435.05, 500.05, 565.05]
-  const periode = [encNum(d.totalBrut, 2, true), encNum(pmss, 2, true), encNum(Math.min(parseFloat(d.totalBrut) || 0, pmss), 2, true),
+  const periode = [encNum(d.totalBrut, 2, true), encNum(pmss, 2, true), encNum(Number.isFinite(d.currentMonthData?.baseTA) ? d.currentMonthData.baseTA : Math.min(parseFloat(d.totalBrut) || 0, pmss), 2, true),
     encNum(d.totalCotisPat, 2, true), encNum(heuresPayees, 3, true), hsExoMois > 0 ? encNum(hs, 3) : '', encNum(hsExoMois), encNum(d.baseIR, 2, true)]
   const annee = [encNum(cum.brut, 2, true), encNum(plafondCumul, 2, true), encNum(cum.baseTA ?? Math.min(parseFloat(cum.brut) || 0, plafondCumul), 2, true),
     encNum(cum.cotisPat, 2, true), encNum(cum.heures, 3, true), '', encNum(cum.hsExonere), encNum(cum.netImposable, 2, true)]
@@ -2452,6 +2540,11 @@ export function layoutColonnes(data, employerInfo, employeeInfo, month, year) {
   } else if (d.primeExceptionnelle > 0) {
     push({ kind: 'pay', label: 'Prime exceptionnelle', amt: d.primeExceptionnelle })
   }
+  const cpCol = lignesCongesPayes(d)
+  if (cpCol) {
+    push({ kind: 'pay', label: cpCol.absence, base: cpCol.jours, amt: -cpCol.retenue })
+    push({ kind: 'pay', label: cpCol.indemnite, base: cpCol.jours, amt: cpCol.montant })
+  }
   push({ kind: 'blank' })
   push({ kind: 'total', label: 'Total Brut', amt: d.totalBrut })
   push({ kind: 'blank' })
@@ -2461,7 +2554,7 @@ export function layoutColonnes(data, employerInfo, employeeInfo, month, year) {
   // le taux nominal ; on imprime la part NOMINALE (base × taux) pour que chaque
   // ligne se vérifie, et l'exonération sur sa propre ligne plus bas.
   const partSal = (c) => (d.isApprenti && (parseFloat(c.tauxSal) || 0) > 0
-    ? Math.round((parseFloat(c.base) || 0) * (parseFloat(c.tauxSal) || 0)) / 100
+    ? Math.round((((parseFloat(c.base) || 0) * (parseFloat(c.tauxSal) || 0) / 100) + Number.EPSILON) * 100) / 100
     : parseFloat(c.partSal) || 0)
   let exoApprenti = 0
   const valeurs = (c) => {
@@ -2470,7 +2563,7 @@ export function layoutColonnes(data, employerInfo, employeeInfo, month, year) {
     return { base: c.base, taux: c.tauxSal, amt: ps > 0 ? -ps : 0, tpat: c.tauxPat, mpat: c.partPat > 0 ? -c.partPat : 0 }
   }
   const groupes = new Map()
-  ;(d.cotisations || []).forEach((c) => {
+  fusionCsgPsc(d.cotisations).forEach((c) => {
     const cat = /^accident/i.test(c.name || '') ? '__AT__' : (c.category || '')
     if (!groupes.has(cat)) groupes.set(cat, [])
     groupes.get(cat).push(c)
@@ -2538,6 +2631,11 @@ export function layoutColonnes(data, employerInfo, employeeInfo, month, year) {
   push({ kind: 'blank' })
   push({ kind: 'total', label: 'Total des cotisations et contributions sociales', amt: -(d.totalCotisSal || 0), mpat: -(d.totalCotisPat || 0) })
   push({ kind: 'blank' })
+  // Part patronale frais de santé ajoutée au net imposable (information seule :
+  // n'entre pas dans le net social / à payer) — même place que sur Sage.
+  if ((parseFloat(d.reintegrationSante) || 0) > 0) {
+    push({ kind: 'pay', label: 'Réintégration fiscale complémentaire santé', amt: d.reintegrationSante })
+  }
   push({ kind: 'band', label: 'Montant Net social', amt: d.netSocial })
   push({ kind: 'blank' })
   push({ kind: 'band', label: 'Net à payer avant impôt', amt: d.netAvantIR })
