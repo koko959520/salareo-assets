@@ -48,6 +48,110 @@ function formatDateFR(value) {
 }
 
 /**
+ * Date de paiement par défaut : dernier jour OUVRÉ du mois (ni samedi, ni
+ * dimanche, ni jour férié légal). Renvoie 'YYYY-MM-DD'.
+ */
+export function datePaiementParDefaut(year, month) {
+  const feries = joursFeries(year)
+  const d = new Date(year, month + 1, 0)
+  const cle = (x) => `${x.getFullYear()}-${String(x.getMonth() + 1).padStart(2, '0')}-${String(x.getDate()).padStart(2, '0')}`
+  while (d.getDay() === 0 || d.getDay() === 6 || feries.has(cle(d))) d.setDate(d.getDate() - 1)
+  return cle(d)
+}
+
+/**
+ * Date de paiement IMPRIMÉE (R.3243-1 11°), au format JJ/MM/AAAA : celle saisie
+ * pour le mois (`data.datePaiement`, ISO), sinon le dernier jour ouvré du mois.
+ * Avant le 17/11/2026 tous les modèles imprimaient le dernier jour de la
+ * période — parfois un samedi ou un dimanche — qui ne correspondait pas à la
+ * date du virement sur le relevé du salarié.
+ */
+export function datePaiementDe(data, month, year, imprimeeAvant) {
+  const saisie = /^\d{4}-\d{2}-\d{2}/.test(String(data?.datePaiement || '')) ? data.datePaiement : null
+  if (saisie) return formatDateFR(saisie)
+  // Bulletin émis AVANT le champ (instantané sans datePaiement) : on réimprime la
+  // date qu'il portait déjà, sinon deux copies du même bulletin remis au
+  // salarié ne concorderaient plus — un écart que les organismes repèrent.
+  return imprimeeAvant || formatDateFR(datePaiementParDefaut(year, month))
+}
+
+/** Mention R.3243-1 15° (rubrique du bulletin sur service-public.fr), texte commun à tous les modèles. */
+export const MENTION_SERVICE_PUBLIC = 'Pour davantage d\'informations, voir la rubrique dédiée au bulletin de paie sur www.service-public.fr.'
+
+/**
+ * Libellés imposés par l'arrêté du 25/02/2016 modifié (31/01/2023) pour les
+ * lignes de CSG/CRDS. Le moteur garde ses noms internes (la DSN s'y appuie) ;
+ * seuls les modèles imprimés les traduisent.
+ */
+export function libelleOfficiel(nom) {
+  if (nom === 'CSG non imposable') return 'CSG déductible de l\'impôt sur le revenu'
+  if (nom === 'CSG/CRDS imposable') return 'CSG/CRDS non déductible de l\'impôt sur le revenu'
+  return nom
+}
+
+/**
+ * Mention de la convention collective (R.3243-1 3°), commune aux modèles :
+ * « IDCC 1486 - <intitulé> », ou, sans convention, la référence au Code du
+ * travail pour les congés payés et le préavis. Jamais « IDCC 0000 », « DROIT
+ * COMMUN - 0000 » ni « GENERAL » (code interne) comme avant le 17/11/2026.
+ */
+export function conventionMention(emp) {
+  const conv = String(emp?.convention || '')
+  const nom = String(emp?.conventionName || emp?.customConventionName || '').trim()
+  const idccConv = (/^IDCC(\d{1,4})$/i.exec(conv) || [])[1] || ''
+  const idcc = String(emp?.conventionIdcc || emp?.customConventionIdcc || idccConv).replace(/\D/g, '')
+  const sansConvention = conv === 'GENERAL' || (!nom && !idcc) || /^0+$/.test(idcc)
+  if (sansConvention) return 'Aucune - Code du travail (congés : L.3141-3 ; préavis : L.1234-1)'
+  // « Convention collective nationale des … » est redondant derrière la
+  // rubrique « Convention » / « CCN » : on le retire pour que le nom de la
+  // branche (et son sigle entre parenthèses) tienne sans être coupé.
+  const court = nom.replace(/^convention\s+collective\s+(nationale\s+)?(interrégionale\s+|régionale\s+|départementale\s+)?(de\s+la\s+|de\s+l'|du\s+|des\s+|de\s+|d')?/i, '').trim() || nom
+  const intitule = court.charAt(0).toUpperCase() + court.slice(1)
+  if (nom) return `${idcc ? `IDCC ${idcc} - ` : ''}${intitule}`
+  return `IDCC ${idcc}`
+}
+
+/**
+ * Taux salarial IMPRIMÉ d'une ligne : le taux nominal, sauf si le montant de la
+ * ligne a déjà été réduit par une exonération (apprenti, art. L.6243-2) — on
+ * imprime alors le taux effectif, pour que base × taux = montant reste vrai sur
+ * le bulletin (présentation « taux effectifs » admise par le BOSS, bulletin de
+ * paie, question 20). Avant le 17/11/2026 ces lignes imprimaient le taux plein
+ * à côté du montant réduit.
+ */
+export function tauxSalAffiche(c) {
+  const base = c?.base || 0, t = c?.tauxSal || 0, part = c?.partSal || 0
+  if (base > 0 && t > 0 && Math.abs(base * t / 100 - part) > 0.02) return Math.round(part / base * 100000) / 1000
+  return t
+}
+
+/**
+ * Exonérations et allègements à imprimer sur UNE ligne, part salariale et part
+ * patronale séparées, calculés comme l'écart entre la somme des lignes
+ * imprimées et les totaux : la colonne se recalcule donc toujours au centime.
+ * (Avant le 17/11/2026 les modèles traditionnel et cabinet imprimaient tout le
+ * montant en part patronale : ni la colonne salariale ni la patronale ne
+ * retombaient sur leur total.)
+ */
+export function exonerationsReparties(data) {
+  const lignes = fusionCsgPsc(data?.cotisations || [])
+  const r2 = (x) => Math.round(x * 100) / 100
+  const sal = r2(lignes.reduce((a, c) => a + (c.partSal || 0), 0) - (data?.totalCotisSal || 0))
+  const pat = r2(lignes.reduce((a, c) => a + (c.partPat || 0), 0) - (data?.totalCotisPat || 0))
+  return { sal: Math.abs(sal) < 0.005 ? 0 : sal, pat: Math.abs(pat) < 0.005 ? 0 : pat }
+}
+
+/**
+ * Montant de l'allègement de cotisations EMPLOYEUR : réduction générale et
+ * déduction forfaitaire patronale sur heures sup. — sans la réduction
+ * SALARIALE des heures sup. ni l'exonération salariale des apprentis, qui
+ * étaient comptées dedans avant le 17/11/2026.
+ */
+export function allegementEmployeur(data) {
+  return Math.max(0, Math.round(((data?.totalAllegements || 0) - (data?.exoCotisSalHS || 0) - (data?.exoCotisSalApprenti || 0)) * 100) / 100)
+}
+
+/**
  * Congés payés pris dans le mois (art. R.3243-1 12° : le bulletin mentionne les
  * dates de congé et le montant de l'indemnité). Absence = retenue au maintien ;
  * indemnité = maintien, ou dixième s'il est plus favorable (l'écart est dans le
@@ -103,7 +207,40 @@ export function fusionCsgPsc(cotisations) {
  * isomorphe. `options.watermark = true` appose un filigrane SPÉCIMEN (aperçu non payé).
  * @returns instance jsPDF (non sauvegardée)
  */
+/**
+ * Construit le bulletin PDF (tous modèles) puis renseigne ses métadonnées :
+ * titre, auteur = l'employeur, logiciel créateur = Salareo, date de création =
+ * date d'émission du bulletin. Le champ « Producer » reste celui de la
+ * bibliothèque (jsPDF) : on ne maquille jamais la provenance technique.
+ *
+ * Pourquoi : jusqu'au 17/11/2026 le PDF ne portait aucune métadonnée et sa date
+ * de création était celle du téléchargement (un bulletin de janvier re-téléchargé
+ * en novembre était « créé » en novembre, contrôle classique des outils
+ * anti-fraude et de DossierFacile, qui affichent ces champs à leurs agents).
+ * Pas de nom ni de numéro de sécurité sociale dans les métadonnées.
+ *
+ * @param {object} [options]
+ * @param {string} [options.dateEmission]  ISO — date d'émission du bulletin
+ *        (instantané figé), jamais antidatée. Absente : date du jour.
+ */
 export function buildPdfDoc(JsPDF, data, employerInfo, employeeInfo, month, year, template = 'classic', options = {}) {
+  const doc = buildPdfDocModele(JsPDF, data, employerInfo, employeeInfo, month, year, template, options)
+  const periode = `${MOIS_FR[month] || ''} ${year}`.trim()
+  doc.setProperties({
+    title: `Bulletin de paie ${periode}`,
+    subject: 'Bulletin de paie',
+    author: String(employerInfo?.nom || '').trim(),
+    keywords: `bulletin de paie, ${periode}`,
+    creator: 'Salareo - logiciel de paie',
+  })
+  const emission = options?.dateEmission ? new Date(options.dateEmission) : null
+  if (emission && !isNaN(emission.getTime())) {
+    try { doc.setCreationDate(emission) } catch { /* hors plage jsPDF : date du jour */ }
+  }
+  return doc
+}
+
+function buildPdfDocModele(JsPDF, data, employerInfo, employeeInfo, month, year, template = 'classic', options = {}) {
   // Le modèle « traditionnel » ne partage AUCUNE géométrie avec les trois autres
   // (monospace, 5 colonnes propres, rubriques en capitales, pagination à en-tête
   // répété). Il est donc rendu par une fonction dédiée plutôt qu'en ajoutant une
@@ -145,6 +282,7 @@ export function buildPdfDoc(JsPDF, data, employerInfo, employeeInfo, month, year
   // Période réelle : bornée aux dates d'entrée/sortie si mois incomplet (proratisation B6).
   const periodStart = data.proration?.periodeDebut || `01/${String(month + 1).padStart(2, '0')}/${year}`
   const periodEnd = data.proration?.periodeFin || `${lastDay}/${String(month + 1).padStart(2, '0')}/${year}`
+  const datePaie = datePaiementDe(data, month, year, periodEnd)
 
   // Colors (Dynamic based on selected template)
   let PRIMARY = [29, 29, 31]      // Default: #1d1d1f (Apple Ink)
@@ -246,7 +384,7 @@ export function buildPdfDoc(JsPDF, data, employerInfo, employeeInfo, month, year
     if (digits.length === 14) {
       return `${digits.slice(0,3)} ${digits.slice(3,6)} ${digits.slice(6,9)} ${digits.slice(9)}`
     }
-    return siret || '000 000 000 00000'
+    return siret || ''
   }
 
   // Tronque une chaîne à la largeur dispo (mesure jsPDF avec la police courante).
@@ -273,7 +411,9 @@ export function buildPdfDoc(JsPDF, data, employerInfo, employeeInfo, month, year
     if (conv === 'IDCC2148') return 'TELECOMS - 2148'
     if (conv === 'IDCC3248') return 'METALLURGIE - 3248'
     if (conv === 'CUSTOM') return `IDCC ${employerInfo.customConventionIdcc || ''}`
-    return 'DROIT COMMUN - 0000'
+    // Sans convention : R.3243-1 3° impose la référence au Code du travail
+    // (congés payés, préavis). « DROIT COMMUN - 0000 » n'est pas un IDCC réel.
+    return 'Aucune - Code du travail (congés : L.3141-3 ; préavis : L.1234-1)'
   }
 
   // Seniority calculation
@@ -320,16 +460,22 @@ export function buildPdfDoc(JsPDF, data, employerInfo, employeeInfo, month, year
   doc.setFontSize(8)
   doc.setFont('helvetica', 'bold')
   setColor(PRIMARY)
-  doc.text(fitText(employerInfo.nom || 'Nom Entreprise', colW1), margin, y + 3)
+  doc.text(fitText(employerInfo.nom || '', colW1), margin, y + 3)
   doc.setFont('helvetica', 'normal')
   doc.setFontSize(6.5)
   setColor(BLACK)
-  doc.text(fitText(employerInfo.adresse || 'Adresse', colW1), margin, y + 7)
-  doc.text(fitText(`${employerInfo.codePostal || '75000'} ${employerInfo.ville || 'VILLE'}`, colW1), margin, y + 10)
+  doc.text(fitText(employerInfo.adresse || '', colW1), margin, y + 7)
+  doc.text(fitText(`${employerInfo.codePostal || ''} ${employerInfo.ville || ''}`.trim(), colW1), margin, y + 10)
   setColor(GRAY)
   doc.text(`SIRET : ${formatSIRET(employerInfo.siret)}`, margin, y + 14)
-  doc.text(`Code APE : ${employerInfo.codeAPE || '0000Z'}`, margin, y + 17)
-  doc.text(`Convention : ${formatConvText(employerInfo.convention, colW1 - 18)}`, margin, y + 20)
+  doc.text(`Code APE : ${employerInfo.codeAPE || ''}`, margin, y + 17)
+  // Intitulé de la convention (R.3243-1 3°) sur 3 lignes au plus : il était
+  // tronqué à « Convention collective na… », sans le nom de la branche.
+  const convTexte = conventionMention(employerInfo)
+  const convLignes = doc.splitTextToSize(`Convention : ${convTexte}`, colW1 - 1)
+  convLignes.slice(0, 3).forEach((l, i) => {
+    doc.text(i === 2 && convLignes.length > 3 ? fitText(`${l} ${convLignes[3]}`, colW1 - 1) : l, margin, y + 20 + i * 3)
+  })
 
   // Col 2: Employee
   doc.setFontSize(8)
@@ -375,7 +521,7 @@ export function buildPdfDoc(JsPDF, data, employerInfo, employeeInfo, month, year
   ].filter(Boolean)
   const classifText = classifParts.length ? classifParts.join(' · ') : (employeeInfo.statut || '—')
   const col3X = margin + colW1 + colW2 + 5
-  doc.text(`Emploi : ${employeeInfo.emploi || 'Employé'}`, col3X, y + 9)
+  doc.text(fitText(`Emploi : ${employeeInfo.emploi || ''}`, contentW - (col3X - margin)), col3X, y + 9)
   doc.text(`Statut : ${employeeInfo.statut || '—'}`, col3X, y + 13)
   doc.text(`Classification : ${classifText}`, col3X, y + 17)
   doc.text(`Salaire de base : ${formatMontant(data.salaireBase)} €`, col3X, y + 21)
@@ -624,9 +770,9 @@ export function buildPdfDoc(JsPDF, data, employerInfo, employeeInfo, month, year
       y += CAT_H
     }
     drawPdfRow([
-      c.name,
+      libelleOfficiel(c.name),
       formatMontant(c.base),
-      c.tauxSal > 0 ? formatTaux(c.tauxSal) : '-',
+      c.tauxSal > 0 ? formatTaux(tauxSalAffiche(c)) : '-',
       c.partSal > 0 ? formatMontant(c.partSal) : '-',
       c.partPat > 0 ? formatMontant(c.partPat) : '-'
     ], { indent: true })
@@ -638,7 +784,7 @@ export function buildPdfDoc(JsPDF, data, employerInfo, employeeInfo, month, year
     doc.setFontSize(Math.min(6.2, CAT_H * 1.6))
     doc.setFont('helvetica', 'bold')
     setColor(CATEGORY_TEXT)
-    doc.text('Allègements de cotisations', tableX + 2, y + CAT_H * 0.68)
+    doc.text('Exonérations et allègements de cotisations', tableX + 2, y + CAT_H * 0.68)
     drawLine(tableX, y + CAT_H, tableX + tableW, y + CAT_H)
     y += CAT_H
 
@@ -673,7 +819,7 @@ export function buildPdfDoc(JsPDF, data, employerInfo, employeeInfo, month, year
 
   // TOTAL RETENUES
   drawPdfRow([
-    'Total cotisations salariales  (4)', '-', '-',
+    'Total des cotisations et contributions  (4)', '-', '-',
     formatMontant(data.totalCotisSal),
     formatMontant(data.totalCotisPat)
   ], { bold: true, bgColor: LIGHT_GRAY, textColor: PRIMARY })
@@ -694,7 +840,11 @@ export function buildPdfDoc(JsPDF, data, employerInfo, employeeInfo, month, year
   doc.setFontSize(Math.min(5.5, DISC_H * 1.7))
   doc.setFont('helvetica', 'italic')
   setColor(GRAY)
-  doc.text('Dont évolution de la rémunération liée à la suppression des cotisations chômage et maladie : 0,00 €', tableX + 2, y + DISC_H * 0.7)
+  // Ancienne ligne « Dont évolution de la rémunération… : 0,00 € » : montant figé
+  // à 0 quel que soit le salaire (faux), et ligne facultative depuis l'arrêté de
+  // 2023 (BOSS, bulletin de paie, question 5). Remplacée par la mention
+  // obligatoire de la rubrique service-public (R.3243-1 15°).
+  doc.text(MENTION_SERVICE_PUBLIC, tableX + 2, y + DISC_H * 0.7)
   drawLine(tableX, y + DISC_H, tableX + tableW, y + DISC_H)
   y += DISC_H
 
@@ -788,7 +938,7 @@ export function buildPdfDoc(JsPDF, data, employerInfo, employeeInfo, month, year
   // Info details list
   const infoItems = [
     { label: 'Total versé par l\'employeur :', val: `${formatMontant(data.totalVerseEmployeur)} €`, color: BLACK },
-    { label: 'Allègement de cotisations employeur :', val: `${formatMontant(data.totalAllegements)} €`, color: SUCCESS_GREEN },
+    { label: 'Allègement de cotisations employeur :', val: `${formatMontant(allegementEmployeur(data))} €`, color: SUCCESS_GREEN },
     { label: 'Net imposable :', val: `${formatMontant(data.baseIR)} €`, color: BLACK },
     { label: 'Temps travaillé ce mois :', val: `${formatMontant(data.horaireMensuel + data.heuresSupp)} h`, color: BLACK }
   ]
@@ -932,16 +1082,18 @@ export function buildPdfDoc(JsPDF, data, employerInfo, employeeInfo, month, year
   setColor(BLACK)
   doc.setFont('helvetica', 'bold')
   doc.text(data.modePaiement || employerInfo.modePaiement || 'Virement bancaire', margin + 24, footerY + 5)
-  doc.text(periodEnd, margin + 24, footerY + 9)
+  doc.text(datePaie, margin + 24, footerY + 9)
 
   doc.setFont('helvetica', 'normal')
   doc.setFontSize(5.2)
   setColor(GRAY)
-  doc.text('Formule : Rémunération brute (1) + Exonération (2) - Retenues salariales (4) - Impôt source (5)', margin, footerY + 14)
+  doc.text('Net payé = rémunération brute (1) - total des cotisations et contributions salariales (4) - impôt prélevé à la source (5)', margin, footerY + 14)
 
   // Numérotation de page
+  // Seulement s'il y a plusieurs pages : « Page 1/1 » était dessiné SOUS
+  // l'encadré du net payé (texte caché, signal classique de document retouché).
   const totalPages = doc.getNumberOfPages()
-  for (let p = 1; p <= totalPages; p++) {
+  for (let p = 1; totalPages > 1 && p <= totalPages; p++) {
     doc.setPage(p)
     doc.setFontSize(5.5)
     doc.setFont('helvetica', 'normal')
@@ -1086,6 +1238,7 @@ function buildTraditionnelDoc(JsPDF, data, employerInfo, employeeInfo, month, ye
   const mm2 = String(month + 1).padStart(2, '0')
   const periodStart = data.proration?.periodeDebut || `01/${mm2}/${year}`
   const periodEnd = data.proration?.periodeFin || `${lastDay}/${mm2}/${year}`
+  const datePaie = datePaiementDe(data, month, year, periodEnd)
   const shortPeriod = `${mm2}/${String(year).slice(2)}`
 
   // ── Primitives ────────────────────────────────────────────────────────────
@@ -1152,16 +1305,17 @@ function buildTraditionnelDoc(JsPDF, data, employerInfo, employeeInfo, month, ye
   fusionCsgPsc(data.cotisations).forEach((c) => {
     if (c.category !== cat) { cat = c.category; rows.push({ kind: 'cat', label: c.category }) }
     item({
-      label: c.name, sub: true,
-      base: c.base, taux: c.tauxSal,
+      label: libelleOfficiel(c.name), sub: true,
+      base: c.base, taux: tauxSalAffiche(c),
       salAmt: c.partSal > 0 ? -c.partSal : 0,
       patAmt: c.partPat > 0 ? -c.partPat : 0,
     })
   })
 
-  if ((data.totalAllegements || 0) > 0) {
+  const exoTrad = exonerationsReparties(data)
+  if (exoTrad.sal || exoTrad.pat) {
     gap()
-    item({ label: 'ALLEGEMENT DE COTISATIONS :', cap: true, patAmt: data.totalAllegements })
+    item({ label: 'EXONERATIONS ET ALLEGEMENTS DE COTISATIONS :', cap: true, salAmt: exoTrad.sal, patAmt: exoTrad.pat })
   }
 
   gap()
@@ -1195,8 +1349,8 @@ function buildTraditionnelDoc(JsPDF, data, employerInfo, employeeInfo, month, ye
     doc.text('-'.repeat(59), T.X0, 32.1)
 
     // Convention collective (gauche) + identité du salarié (droite)
-    const ccn = emp.conventionName || emp.convention || ''
-    if (ccn) doc.text(clip(`CCN  ${ccn}`, 100), T.X0, 46.5)
+    const ccnLignes = doc.splitTextToSize(`CCN  ${conventionMention(emp)}`, 100)
+    ccnLignes.slice(0, 2).forEach((l, i) => doc.text(i === 1 ? clip(ccnLignes.slice(1).join(' '), 100) : l, T.X0, 46.5 + i * 2.8))
 
     const civil = sal.sexe === 'F' ? 'Mme' : sal.sexe === 'M' ? 'M.' : ''
     doc.text(clip([civil, sal.prenom, (sal.nom || '').toUpperCase()].filter(Boolean).join(' '), 78), T.EMP_X, 43.7)
@@ -1220,7 +1374,7 @@ function buildTraditionnelDoc(JsPDF, data, employerInfo, employeeInfo, month, ye
     const siret = formatSiretTrad(emp.siret)
     doc.text(clip(`SIRET : ${siret}    NAF : ${emp.codeAPE || ''}`, 110), T.X0, 92.0)
     doc.text(`PERIODE ${periodStart} ${periodEnd}`, 140.0, 88.9)
-    doc.text(`DATE DE PAIE : ${periodEnd}`, 140.0, 92.0)
+    doc.text(`DATE DE PAIE : ${datePaie}`, 140.0, 92.0)
 
     // Bandeau des colonnes
     fill(T.X0, T.BAND_TOP, T.X1 - T.X0, T.BAND_H, TRAD_SKY)
@@ -1272,12 +1426,8 @@ function buildTraditionnelDoc(JsPDF, data, employerInfo, employeeInfo, month, ye
     doc.text('NET A PAYER AVANT IMPOT SUR LE REVENU', T.X0, T.NET_Y)
     if (filled) { mono(7.6, 'bold'); ink([0, 0, 0]); right(fmtTrad(data.netAvantIR, true), T.R3, T.NET_Y) }
 
-    // Mention réglementaire (bandeau bleu clair)
-    fill(T.X0, T.NET_Y + 1.8, T.X1 - T.X0, 3.6, TRAD_SKY)
-    stroke(T.X0, T.NET_Y + 1.8, T.X1 - T.X0, 3.6)
-    ;[T.C1, T.C2, T.C3, T.C4].forEach((x) => rule(x, T.NET_Y + 1.8, x, T.NET_Y + 5.4))
-    sans(4.6, 'bold'); ink(TRAD_NAVY)
-    doc.text("Dont évolution de la rémunération liée à la suppression des cotisations chômage et maladie", T.X0 + 1, T.NET_Y + 4.3)
+    // L'ancien bandeau « Dont évolution de la rémunération… » était imprimé SANS
+    // montant (ligne facultative depuis l'arrêté de 2023, BOSS question 5) : retiré.
 
     // Bloc impôt sur le revenu — bandeau bleu sur « libellé + Base » et sur
     // « Montant », zone blanche au milieu (emplacement du taux personnalisé).
@@ -1371,7 +1521,7 @@ function buildTraditionnelDoc(JsPDF, data, employerInfo, employeeInfo, month, ye
     const xs = [T.X0 + 16]
     for (let i = 1; i < cw.length; i++) xs.push(xs[i - 1] + cw[i])
     const heads = ['BRUT', 'COTISATIONS\nSALARIALES', 'COTISATIONS\nPATRONALES', 'NET IMPOSABLE',
-      'BRUT CONGES PAYES', 'Allègements cotisations\nemployeur', 'Total versé par l\'employeur']
+      'BRUT CONGES PAYES', 'Exonérations et\nallègements', 'Total versé par l\'employeur']
     const hH = 5.6
     fill(xs[0], T.RECAP_TOP, xs[7] - xs[0], hH, TRAD_SKY)
     sans(4.5, 'bold'); ink(TRAD_NAVY)
@@ -1405,7 +1555,7 @@ function buildTraditionnelDoc(JsPDF, data, employerInfo, employeeInfo, month, ye
 
     // Pied de page
     sans(5.6); ink(TRAD_BLUE)
-    center('Pour la définition des termes employés, se reporter au site internet www.service-public.fr rubrique cotisations sociales', 105, T.FOOT_Y)
+    center(MENTION_SERVICE_PUBLIC, 105, T.FOOT_Y)
     mono(6); ink([0, 0, 0])
     const ref = [sal.matricule || '', (sal.nom || '').toUpperCase(), sal.prenom || '', periodEnd].filter(Boolean).join('   ')
     doc.text(clip(ref, 190, 6), T.X0, T.CODE_Y)
@@ -1564,6 +1714,7 @@ function buildCabinetDoc(JsPDF, data, employerInfo, employeeInfo, month, year, o
   const mm2 = String(month + 1).padStart(2, '0')
   const periodStart = data.proration?.periodeDebut || `01/${mm2}/${year}`
   const periodEnd = data.proration?.periodeFin || `${lastDay}/${mm2}/${year}`
+  const datePaie = datePaiementDe(data, month, year, periodEnd)
   const dateLongue = (ddmmyyyy) => {
     const [d, m, y] = String(ddmmyyyy).split('/')
     return `${d} ${MOIS_CAB[parseInt(m, 10) - 1] || ''} ${y}`
@@ -1599,10 +1750,11 @@ function buildCabinetDoc(JsPDF, data, employerInfo, employeeInfo, month, year, o
    * [entier][filet][2 décimales][signe]. Le signe négatif est suffixé.
    * Renvoie le x gauche de l'entier (pour les points de conduite) ou null.
    */
-  const cell = (value, xr, y, size, { keepZero = false, forceNeg = false } = {}) => {
+  const cell = (value, xr, y, size, { keepZero = false, forceNeg = false, dec = 2 } = {}) => {
     const n = parseFloat(value)
     if (!Number.isFinite(n) || (!keepZero && n === 0)) return null
-    const [intPart, decPart] = Math.abs(n).toFixed(2).split('.')
+    // `dec` > 2 : la 3e décimale déborde sur la colonne du signe (vide pour un taux).
+    const [intPart, decPart] = Math.abs(n).toFixed(dec).split('.')
     const ch = chW(size)
     const signX = xr - ch
     const decX = signX - 2 * ch
@@ -1665,7 +1817,7 @@ function buildCabinetDoc(JsPDF, data, employerInfo, employeeInfo, month, year, o
   kvR('PERIODE D\'EMPLOI', `${mm2}/${year}`, hy); hy += 4.2
   kvR('DU', dateLongue(periodStart), hy, true); hy += 4.2
   kvR('AU', dateLongue(periodEnd), hy, true); hy += 4.2
-  kvR('DATE DE PAIEMENT', dateLongue(periodEnd), hy); hy += 4.2
+  kvR('DATE DE PAIEMENT', dateLongue(datePaie), hy); hy += 4.2
   kvR('NO DE SECURITE SOCIALE', String(sal.numSecu || '').replace(/\s/g, ''), hy)
 
   // ═══ 2ᵉ RANG : SIRET / APE / CCN — identité du salarié ══════════════════════
@@ -1676,9 +1828,9 @@ function buildCabinetDoc(JsPDF, data, employerInfo, employeeInfo, month, year, o
   sans(6.2); doc.text('N° APE:', CAB.X0 + 62, y)
   mono(8); doc.text(String(emp.codeAPE || ''), CAB.X0 + 76, y)
   sans(6.2); doc.text('CONVENTION', CAB.X0, y + 6); doc.text('COLLECTIVE:', CAB.X0, y + 9.5)
-  const ccn = capsCab(emp.conventionName || emp.convention || '')
+  const ccn = capsCab(conventionMention(emp))
   mono(8)
-  doc.splitTextToSize(ccn, 70).slice(0, 2).forEach((l, i) => doc.text(l, CAB.X0 + 24, y + 6 + i * 3.6))
+  doc.splitTextToSize(ccn, 70).slice(0, 3).forEach((l, i) => doc.text(l, CAB.X0 + 24, y + 6 + i * 3.6))
 
   mono(9, 'bold')
   doc.text(clip(capsCab([sal.nom, sal.prenom].filter(Boolean).join(' ')), 80, 9), 118, y + 7)
@@ -1694,11 +1846,13 @@ function buildCabinetDoc(JsPDF, data, employerInfo, employeeInfo, month, year, o
     mono(6.6); ink(CAB_INK)
     doc.text(label, x, yy); doc.text(':' + String(value == null ? '' : value), colon, yy)
   }
+  // Niveau et coefficient d'abord (mention R.3243-1 4°) : le statut en tête
+  // faisait couper le coefficient (« … COEF. . »).
   const classif = [
-    sal.statut ? capsCab(sal.statut) : '',
     sal.niveau ? `NIV. ${sal.niveau}` : '',
     sal.coefficient ? `COEF. ${sal.coefficient}` : '',
     sal.echelon ? `ECH. ${sal.echelon}` : '',
+    sal.statut ? capsCab(sal.statut) : '',
   ].filter(Boolean).join(' ')
   kvE('AFFECTATION', clip(capsCab(emp.nom || ''), 44, 6.6), CAB.X0 + 2, ey + 4, CAB.X0 + 30)
   kvE('EMPLOI', clip(capsCab(sal.emploi || ''), 44, 6.6), CAB.X0 + 2, ey + 7.5, CAB.X0 + 30)
@@ -1764,14 +1918,15 @@ function buildCabinetDoc(JsPDF, data, employerInfo, employeeInfo, month, year, o
     }
     if (g.items.length === 1 && fusionnable(g.items[0], g.category)) {
       const c = g.items[0]
-      item({ label: capsCab(g.category), cap: true, base: c.base, taux: c.tauxSal, salAmt: c.partSal > 0 ? -c.partSal : 0, patAmt: c.partPat > 0 ? c.partPat : 0 })
+      item({ label: capsCab(g.category), cap: true, base: c.base, taux: tauxSalAffiche(c), salAmt: c.partSal > 0 ? -c.partSal : 0, patAmt: c.partPat > 0 ? c.partPat : 0 })
     } else {
       rows.push({ kind: 'cat', label: capsCab(g.category) })
-      g.items.forEach((c) => item({ label: capsCab(c.name), sub: true, base: c.base, taux: c.tauxSal, salAmt: c.partSal > 0 ? -c.partSal : 0, patAmt: c.partPat > 0 ? c.partPat : 0 }))
+      g.items.forEach((c) => item({ label: capsCab(libelleOfficiel(c.name)), sub: true, base: c.base, taux: tauxSalAffiche(c), salAmt: c.partSal > 0 ? -c.partSal : 0, patAmt: c.partPat > 0 ? c.partPat : 0 }))
     }
   })
-  if ((data.totalAllegements || 0) > 0) {
-    item({ label: 'EXONERATIONS ET ALLEGEMENTS DE COTISATIONS', cap: true, patAmt: -data.totalAllegements })
+  const exoCab = exonerationsReparties(data)
+  if (exoCab.sal || exoCab.pat) {
+    item({ label: 'EXONERATIONS ET ALLEGEMENTS DE COTISATIONS', cap: true, salAmt: exoCab.sal, patAmt: -exoCab.pat })
   }
   rows.push({ kind: 'total', label: '*COTISAT.SALARIALES.(2)', col: 'sal', value: -(data.totalCotisSal || 0) })
   rows.push({ kind: 'total', label: '*COTISAT.PATRONALES', col: 'pat', value: data.totalCotisPat })
@@ -1836,7 +1991,8 @@ function buildCabinetDoc(JsPDF, data, employerInfo, employeeInfo, month, year, o
     doc.text(clip(r.label, CAB.C_LBL_END - x - 1, bodySize), x, yy)
     mono(bodySize)
     cell(r.base, CAB.C_BASE, yy, bodySize)
-    cell(r.taux, CAB.C_TAUX, yy, bodySize)
+    // Taux à 3 décimales quand il en a (APEC 0,024 % était imprimé « 0,02 »).
+    cell(r.taux, CAB.C_TAUX, yy, bodySize, { dec: [2, 3, 4].find((d) => Math.abs(r.taux * 10 ** d - Math.round(r.taux * 10 ** d)) < 1e-6) || 3 })
     cell(r.salAmt, CAB.C_SAL, yy, bodySize)
     cell(r.patAmt, CAB.C_PAT, yy, bodySize)
     yy += lineH
@@ -2102,6 +2258,7 @@ export function layoutEncadre(data, employerInfo, employeeInfo, month, year) {
   const daysInMonth = new Date(year, month + 1, 0).getDate()
   const periodStart = d.proration?.periodeDebut || `01/${mm}/${year}`
   const periodEnd = d.proration?.periodeFin || `${daysInMonth}/${mm}/${year}`
+  const datePaie = datePaiementDe(d, month, year, periodEnd)
   const joursPeriode = d.proration?.partial ? (d.proration.joursPresents || 0) : daysInMonth
 
   const pmss = parseFloat(d.plafondSS) || ENC_PMSS[year] || 4005
@@ -2155,7 +2312,7 @@ export function layoutEncadre(data, employerInfo, employeeInfo, month, year) {
     if (cat === '__AUTRES_INCONNUES__') { for (const k of groupes.keys()) if (!connues.has(k)) ordre.push(k) } else if (groupes.has(cat)) ordre.push(cat)
   })
   const valeurs = (c) => ({
-    base: c.base, taux: c.tauxSal, amt: c.partSal > 0 ? -c.partSal : 0,
+    base: c.base, taux: tauxSalAffiche(c), amt: c.partSal > 0 ? -c.partSal : 0,
     tpat: c.tauxPat, mpat: c.partPat > 0 ? -c.partPat : 0,
   })
   ordre.forEach((cat) => {
@@ -2262,9 +2419,7 @@ export function layoutEncadre(data, employerInfo, employeeInfo, month, year) {
   tx(encClip([sal.codePostal, sal.ville].filter(Boolean).join('  '), 10, 270), 293, 200.6, 10)
 
   // Convention collective — ou, à défaut, la référence au Code du travail (art. R.3243-1, 3°).
-  const ccn = emp.conventionName
-    ? `C.C.N. ${emp.conventionName}${emp.conventionIdcc ? ` (${emp.conventionIdcc})` : ''}`
-    : 'Convention collective : Code du travail'
+  const ccn = `Convention collective : ${conventionMention(emp)}`
   tx(encClip(ccn, 7, 540), 26.9, 231, 7)
 
   // ── Tableau ───────────────────────────────────────────────────────────────
@@ -2315,7 +2470,7 @@ export function layoutEncadre(data, employerInfo, employeeInfo, month, year) {
   tx('MONTANT NET A PAYER (en Euros)', 23, 695, 7, 'b')
   tx(encNum(d.netAPayer, 2, true), 567, 695, 7, 'b', 'r')
   const mode = String(d.modePaiement || emp.modePaiement || 'VIREMENT').toUpperCase()
-  tx(`Paiement le ${periodEnd} par ${mode}${mode === 'VIREMENT' ? ' sur  RIB' : ''}`, 23, 709, 7)
+  tx(`Paiement le ${datePaie} par ${mode}${mode === 'VIREMENT' ? ' sur  RIB' : ''}`, 23, 709, 7)
   tx('TOTAL VERSE EMPLOYEUR', 23, 721, 7, 'b')
   tx(encNum(d.totalVerseEmployeur, 2, true), 567, 721, 7, 'b', 'r')
 
@@ -2359,7 +2514,7 @@ export function layoutEncadre(data, employerInfo, employeeInfo, month, year) {
   }
 
   tx('DANS VOTRE INTERET ET POUR VOUS AIDER A FAIRE VALOIR VOS DROITS, CONSERVEZ CE BULLETIN DE PAIE SANS LIMITATION DE DUREE.', 84.6, 816, 6)
-  tx('Pour la définition des termes employés, se reporter au site internet service-public.fr rubrique cotisations sociales', 292, 825, 6, 'n', 'c')
+  tx(MENTION_SERVICE_PUBLIC, 292, 825, 6, 'n', 'c')
 
   return { w: 595.28, h: 841.89, ops: ops.concat(texts) }
 }
@@ -2647,6 +2802,7 @@ export function layoutColonnes(data, employerInfo, employeeInfo, month, year) {
   const daysInMonth = new Date(year, month + 1, 0).getDate()
   const periodStart = d.proration?.periodeDebut || `01/${mm}/${year}`
   const periodEnd = d.proration?.periodeFin || `${daysInMonth}/${mm}/${year}`
+  const datePaie = datePaiementDe(d, month, year, periodEnd)
   const pmss = parseFloat(d.plafondSS) || ENC_PMSS[year] || 4005
   const hs = parseFloat(d.heuresSupp) || 0
   const taux = parseFloat(d.tauxHoraire) || 0
@@ -2731,7 +2887,7 @@ export function layoutColonnes(data, employerInfo, employeeInfo, month, year) {
   tx('BULLETIN DE PAIE', centre, 48.94, 19, 'b', 'c', COL_BLEU)
   tx(`Période du ${periodStart} au ${periodEnd}`, centre, 70.11, 10, 'n', 'c', COL_BLEU)
   const mode = String(d.modePaiement || emp.modePaiement || 'Virement').replace(/\s*bancaire$/i, '')
-  tx(`Paiement, le ${periodEnd} par ${mode.charAt(0).toUpperCase()}${mode.slice(1).toLowerCase()}`, centre, 87.1, 10, 'n', 'c', COL_BLEU)
+  tx(`Paiement, le ${datePaie} par ${mode.charAt(0).toUpperCase()}${mode.slice(1).toLowerCase()}`, centre, 87.1, 10, 'n', 'c', COL_BLEU)
 
   ;[['Code :', 123.53, sal.matricule], ['N° Sécurité soc. :', 134.84, String(sal.numSecu || '').replace(/\s/g, '')],
     ['Emploi :', 146.21, sal.emploi], ['Niveau :', 157.51, sal.niveau], ['Coefficient :', 168.89, sal.coefficient],
@@ -2869,7 +3025,7 @@ export function layoutColonnes(data, employerInfo, employeeInfo, month, year) {
   })
 
   tx('Pour vous aider à faire valoir vos droits, conservez ce bulletin de paie sans limitation de durée.', 21.26, 817.66, 7, 'n', 'l', COL_BLEU)
-  tx('Pour la définition des termes employés, se reporter au site internet service-public.fr rubrique cotisations sociales.', 21.26, 825.51, 7, 'n', 'l', COL_BLEU)
+  tx(MENTION_SERVICE_PUBLIC, 21.26, 825.51, 7, 'n', 'l', COL_BLEU)
 
   return { w: 595.28, h: 841.89, ops: ops.concat(texts) }
 }
@@ -3041,6 +3197,7 @@ export function layoutCabinetClarifie(data, employerInfo, employeeInfo, month, y
   const dernier = new Date(year, month + 1, 0).getDate()
   const periodStart = d.proration?.periodeDebut || `01/${mm}/${year}`
   const periodEnd = d.proration?.periodeFin || `${dernier}/${mm}/${year}`
+  const datePaie = datePaiementDe(d, month, year, periodEnd)
 
   // ── En-tête : employeur, titre, références ────────────────────────────────
   ops.push({ k: 'rr', x: 66.5, y: 45, w: 207, h: 59.6, r: 4, fill: null, lw: 0.5 })
@@ -3054,7 +3211,7 @@ export function layoutCabinetClarifie(data, employerInfo, employeeInfo, month, y
     ['NO DE SALARIE', sal.matricule || ''],
     ["PERIODE D'EMPLOI", dLongue(periodStart), 'DU'],
     ['', dLongue(periodEnd), 'AU'],
-    ['DATE DE PAIEMENT', dLongue(periodEnd)],
+    ['DATE DE PAIEMENT', dLongue(datePaie)],
     ['NO DE SECURITE SOCIALE', String(sal.numSecu || '').replace(/\s/g, '')],
   ]
   refs.forEach(([lib, val, du], i) => {
