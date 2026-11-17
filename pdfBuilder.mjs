@@ -224,13 +224,16 @@ export function fusionCsgPsc(cotisations) {
  *        (instantané figé), jamais antidatée. Absente : date du jour.
  */
 export function buildPdfDoc(JsPDF, data, employerInfo, employeeInfo, month, year, template = 'classic', options = {}) {
-  const doc = buildPdfDocModele(JsPDF, data, employerInfo, employeeInfo, month, year, template, options)
+  const Pdf = options.verrouiller === false ? JsPDF : jsPDFVerrouille(JsPDF)
+  // Versement à compter du 01/01/2027 : modèle de l'article 1, quel que soit le modèle choisi.
+  const doc = buildPdfDocModele(Pdf, data, employerInfo, employeeInfo, month, year, modeleApplicable(template, data, month, year), options)
   const periode = `${MOIS_FR[month] || ''} ${year}`.trim()
+  const ref = String(options.reference || '').replace(/[^A-Za-z0-9-]/g, '').slice(0, 32)
   doc.setProperties({
     title: `Bulletin de paie ${periode}`,
-    subject: 'Bulletin de paie',
+    subject: ref ? `Bulletin de paie - réf. ${ref}` : 'Bulletin de paie',
     author: String(employerInfo?.nom || '').trim(),
-    keywords: `bulletin de paie, ${periode}`,
+    keywords: ['bulletin de paie', periode, ref && `réf. ${ref}`, 'émis par Salareo'].filter(Boolean).join(', '),
     creator: 'Salareo - logiciel de paie',
   })
   const emission = options?.dateEmission ? new Date(options.dateEmission) : null
@@ -238,6 +241,23 @@ export function buildPdfDoc(JsPDF, data, employerInfo, employeeInfo, month, year
     try { doc.setCreationDate(emission) } catch { /* hors plage jsPDF : date du jour */ }
   }
   return doc
+}
+
+/**
+ * Bulletin verrouillé comme un relevé bancaire : ouverture libre, impression et
+ * copie permises, modification et annotations interdites. Mot de passe
+ * propriétaire aléatoire, connu de personne.
+ * shortcut: restrictions PDF standard (RC4), retirables par un outil spécialisé ;
+ * passer à une signature électronique côté serveur pour une vraie preuve d'intégrité.
+ */
+function jsPDFVerrouille(JsPDF) {
+  const octets = new Uint8Array(16)
+  globalThis.crypto.getRandomValues(octets)
+  const ownerPassword = Array.from(octets, (x) => x.toString(16).padStart(2, '0')).join('')
+  return function Verrouille(orientation, unit, format) {
+    const o = orientation && typeof orientation === 'object' ? orientation : { orientation, unit, format }
+    return new JsPDF({ ...o, encryption: { userPassword: '', ownerPassword, userPermissions: ['print', 'copy'] } })
+  }
 }
 
 function buildPdfDocModele(JsPDF, data, employerInfo, employeeInfo, month, year, template = 'classic', options = {}) {
@@ -263,6 +283,9 @@ function buildPdfDocModele(JsPDF, data, employerInfo, employeeInfo, month, year,
   // layoutColonnes (même description pour le PDF et l'aperçu écran).
   if (template === 'colonnes') {
     return buildColonnesDoc(JsPDF, data, employerInfo, employeeInfo, month, year, options)
+  }
+  if (template === 'officiel2027') {
+    return buildColonnesDoc(JsPDF, data, employerInfo, employeeInfo, month, year, { ...options, modele2027: true })
   }
   // « cabinet clarifié » : grille + calendrier, rubriques regroupées, RIB —
   // décrit par layoutCabinetClarifie (même description pour l'aperçu écran).
@@ -2777,6 +2800,148 @@ function rubriquesClarifiees(d) {
   return rows
 }
 
+/* ── Modèle de l'article 1 de l'arrêté du 25/02/2016 (rédaction de l'arrêté du
+   31/01/2023, JORFTEXT000047096915), OBLIGATOIRE pour les rémunérations versées
+   à compter du 01/01/2027 : le modèle dérogatoire de l'article 2 (celui des
+   autres modèles Salareo) n'est admis que jusqu'au 1er janvier 2027 (arrêté du
+   11/08/2025, JORFTEXT000052097236). Libellés et ordre recopiés du texte. ── */
+export const DATE_MODELE_2027 = '2027-01-01'
+
+/** Date de versement ISO du bulletin : saisie, sinon dernier jour ouvré du mois. */
+function dateVersementIso(data, month, year) {
+  const s = String(data?.datePaiement || '')
+  return /^\d{4}-\d{2}-\d{2}/.test(s) ? s.slice(0, 10) : datePaiementParDefaut(year, month)
+}
+
+/** Modèle réellement imprimé : celui de l'article 1 pour tout versement à compter du 01/01/2027. */
+export function modeleApplicable(template, data, month, year) {
+  return dateVersementIso(data, month, year) >= DATE_MODELE_2027 ? 'officiel2027' : (template || 'classic')
+}
+
+const P27_LIGNES = [
+  [/pr[ée]voyance/i, 'Prévoyance, Incapacité, Invalidité, Décès, Autres'],
+  [/^Sécurité Sociale - Maladie/i, 'Sécurité Sociale Maladie Maternité Invalidité Décès'],
+  [/mutuelle|compl[ée]mentaire sant[ée]|frais de sant[ée]/i, 'Complémentaire garanties frais de santé obligatoire'],
+  [/^accident/i, 'Accidents du travail & maladies professionnelles'],
+  [/^Sécurité Sociale Plafonnée/i, 'Sécurité Sociale Vieillesse plafonnée'],
+  [/^Sécurité Sociale Déplafonnée/i, 'Sécurité Sociale Vieillesse déplafonnée'],
+  [/^(Complémentaire Tranche (A|1)|CEG Tranche 1)\b/i, 'Retraite complémentaire, CEG et CET T1'],
+  [/^(Complémentaire Tranche 2|CEG Tranche 2)\b/i, 'Retraite complémentaire, CEG et CET T2'],
+  [/équilibre technique|\(CET\)/i, '__CET__'],
+  [/^Allocations familiales/i, 'Famille'],
+  [/^(Chômage|AGS)$/i, 'Assurance chômage'],
+  [/^APEC$/i, 'Apec'],
+]
+const P27_SANTE = ['Sécurité Sociale Maladie Maternité Invalidité Décès', 'Complémentaire garanties frais de santé obligatoire', 'Accidents du travail & maladies professionnelles']
+const P27_RETRAITE = ['Sécurité Sociale Vieillesse plafonnée', 'Sécurité Sociale Vieillesse déplafonnée', 'Retraite complémentaire, CEG et CET T1', 'Retraite complémentaire, CEG et CET T2']
+const P27_SEULES = ['Famille', 'Assurance chômage', 'Apec']
+const P27_CONV = 'Cotisations statutaires ou prévues par la convention collective'
+const P27_PREV = 'Prévoyance, Incapacité, Invalidité, Décès, Autres'
+const P27_COLS = (titre, dernier = 'Employeur') => [titre, 'Base', 'Taux', 'Salarié', dernier]
+
+/**
+ * Lignes de cotisations du modèle 2027 (format des lignes de layoutColonnes :
+ * montants salariaux et patronaux NÉGATIFS, exonérations positives). Le total
+ * des obligatoires est AVANT exonérations (ordre du texte) ; la somme de toutes
+ * les lignes redonne le net avant impôt du moteur (contrôlé par les tests).
+ */
+export function rubriques2027(d) {
+  const r2 = (x) => Math.round((x + Number.EPSILON) * 100) / 100
+  const r4 = (x) => Math.round(x * 10000) / 10000
+  const n = (x) => parseFloat(x) || 0
+  // Apprenti : part salariale NOMINALE (base × taux), l'exonération en ligne dédiée
+  // (même règle que les modèles clarifiés).
+  let exoApprenti = 0
+  const partSal = (c) => {
+    const ps = d.isApprenti && n(c.tauxSal) > 0 ? r2(n(c.base) * n(c.tauxSal) / 100) : n(c.partSal)
+    if (d.isApprenti) exoApprenti += ps - n(c.partSal)
+    return ps
+  }
+  const lignes = new Map() // libellé du modèle → { base, taux, sal, tpat, pat, ordre }
+  const ajoute = (label, base, tauxSal, sal, tauxPat, pat) => {
+    const l = lignes.get(label)
+    if (!l) { lignes.set(label, { label, base: n(base), taux: n(tauxSal), sal, tpat: n(tauxPat), pat }); return }
+    if (Math.abs(l.base - n(base)) >= 0.005) l.baseMixte = true
+    l.taux = r4(l.taux + n(tauxSal)); l.tpat = r4(l.tpat + n(tauxPat))
+    l.sal = r2(l.sal + sal); l.pat = r2(l.pat + pat)
+  }
+  const cot = fusionCsgPsc(d.cotisations)
+  const baseT1 = n(cot.find((c) => /^(Complémentaire Tranche (A|1)|CEG Tranche 1)\b/i.test(c.name || ''))?.base)
+  let autresPat = 0
+  const csg = []
+  cot.forEach((c) => {
+    const nom = c.name || ''
+    if (c.isCSG || c.category === 'CSG/CRDS') { csg.push(c); return }
+    if (c.category === "Autres contributions dues par l'employeur") { autresPat += n(c.partPat); return }
+    const regle = P27_LIGNES.find(([re]) => re.test(nom))
+    const sal = partSal(c)
+    if (regle && regle[1] === '__CET__') {
+      // CET répartie sur T1 et T2 (« Retraite complémentaire, CEG et CET T1/T2 »).
+      const b = n(c.base)
+      const b1 = Math.min(b, baseT1 || b)
+      const s1 = b > 0 ? r2(sal * b1 / b) : sal
+      const p1 = b > 0 ? r2(n(c.partPat) * b1 / b) : n(c.partPat)
+      ajoute('Retraite complémentaire, CEG et CET T1', b1, c.tauxSal, s1, c.tauxPat, p1)
+      if (b - b1 >= 0.005) ajoute('Retraite complémentaire, CEG et CET T2', r2(b - b1), c.tauxSal, r2(sal - s1), c.tauxPat, r2(n(c.partPat) - p1))
+      return
+    }
+    ajoute(regle ? regle[1] : `${P27_CONV}|${nom}`, c.base, c.tauxSal, sal, c.tauxPat, n(c.partPat))
+  })
+
+  // CSG/CRDS : déductible, non déductible, et part afférente aux heures sup.
+  // exonérées d'impôt (revenus non imposables) — même prorata que le moteur
+  // (csgDeductibleHS = CSG déductible × HS / brut).
+  const hsBrut = n(d.hsBrut), brut = n(d.totalBrut)
+  const potentiel = n(d.montantNetHSPotentiel)
+  const fracHS = hsBrut > 0 && brut > 0 && potentiel > 0 ? (hsBrut / brut) * Math.min(1, n(d.montantNetHSExonere) / potentiel) : 0
+  const lignesCsg = []
+  csg.forEach((c) => {
+    const nom = c.name || ''
+    const sal = partSal(c)
+    if (/non imposable/i.test(nom) || (c.isCSG && !c.isImposable && !/imposable/i.test(nom))) {
+      lignesCsg.push({ label: "CSG déductible de l'impôt sur le revenu", base: c.base, taux: c.tauxSal, sal })
+    } else if (fracHS > 0) {
+      const bHS = r2(n(c.base) * fracHS)
+      const sHS = r2(bHS * n(c.tauxSal) / 100)
+      lignesCsg.push({ label: "CSG/ CRDS non déductible de l'impôt sur le revenu", base: r2(n(c.base) - bHS), taux: c.tauxSal, sal: r2(sal - sHS) })
+      lignesCsg.push({ label: 'CSG/ CRDS sur les revenus non imposables', base: bHS, taux: c.tauxSal, sal: sHS })
+    } else {
+      lignesCsg.push({ label: "CSG/ CRDS non déductible de l'impôt sur le revenu", base: c.base, taux: c.tauxSal, sal })
+    }
+  })
+
+  const rows = []
+  const val = (l) => ({ base: l.baseMixte ? null : l.base, taux: l.taux, amt: l.sal > 0 ? -l.sal : 0, tpat: l.tpat, mpat: l.pat > 0 ? -l.pat : 0 })
+  let totSal = 0, totPat = 0
+  const compte = (l) => { totSal += n(l.sal); totPat += n(l.pat) }
+  rows.push({ kind: 'sect', cols: P27_COLS('COTISATIONS ET CONTRIBUTIONS SOCIALES OBLIGATOIRES') })
+  for (const [titre, liste] of [['Santé', P27_SANTE], ['Retraite', P27_RETRAITE]]) {
+    const presentes = liste.filter((k) => lignes.has(k))
+    if (!presentes.length) continue
+    rows.push({ kind: 'head', label: titre })
+    presentes.forEach((k) => { const l = lignes.get(k); compte(l); rows.push({ kind: 'sub', label: k, ...val(l) }) })
+  }
+  P27_SEULES.forEach((k) => { if (lignes.has(k)) { const l = lignes.get(k); compte(l); rows.push({ kind: 'head', label: k, ...val(l) }) } })
+  if (autresPat > 0) { totPat += autresPat; rows.push({ kind: 'head', label: "Autres charges dues par l'employeur", mpat: -r2(autresPat) }) }
+  const conv = [...lignes.keys()].filter((k) => k.startsWith(`${P27_CONV}|`))
+  if (conv.length) {
+    rows.push({ kind: 'head', label: P27_CONV })
+    conv.forEach((k) => { const l = lignes.get(k); compte(l); rows.push({ kind: 'sub', ...val(l), label: k.slice(P27_CONV.length + 1) }) })
+  }
+  lignesCsg.forEach((l) => { totSal += n(l.sal); rows.push({ kind: 'head', label: l.label, base: l.base, taux: l.taux, amt: l.sal > 0 ? -l.sal : 0 }) })
+  rows.push({ kind: 'total', label: 'TOTAL DES COTISATIONS ET CONTRIBUTIONS OBLIGATOIRES', amt: -r2(totSal), mpat: -r2(totPat) })
+
+  const exoSal = r2(n(d.exoCotisSalHS) + exoApprenti)
+  const exoPat = r2(n(d.allegementPatHS) + n(d.reductionGenerale))
+  if (exoSal > 0 || exoPat > 0) rows.push({ kind: 'head', label: 'EXONÉRATIONS ET ALLÈGEMENTS DE COTISATIONS', amt: exoSal > 0 ? exoSal : 0, mpat: exoPat > 0 ? exoPat : 0 })
+
+  if (lignes.has(P27_PREV)) {
+    rows.push({ kind: 'sect', cols: P27_COLS('COTISATIONS ET CONTRIBUTIONS SOCIALES FACULTATIVES') })
+    rows.push({ kind: 'head', label: P27_PREV, ...val(lignes.get(P27_PREV)) })
+  }
+  return rows
+}
+
 /**
  * Description complète de la page (points, origine en haut à gauche, A4).
  * @returns {{ w: number, h: number, ops: Array<object> }}
@@ -2784,7 +2949,8 @@ function rubriquesClarifiees(d) {
  *         { k:'line', x1,y1,x2,y2, lw, col:[r,g,b] }
  *         { k:'tx', s, x, y, size, st:'n'|'b'|'i', al:'l'|'r'|'c', col:[r,g,b] }
  */
-export function layoutColonnes(data, employerInfo, employeeInfo, month, year) {
+export function layoutColonnes(data, employerInfo, employeeInfo, month, year, opts = {}) {
+  const m27 = !!opts.modele2027
   const d = data || {}
   const emp = employerInfo || {}
   const sal = employeeInfo || {}
@@ -2813,6 +2979,23 @@ export function layoutColonnes(data, employerInfo, employeeInfo, month, year) {
   const rows = []
   const push = (o) => rows.push(o)
 
+  const cum = d.cumuls || {}
+  if (m27) {
+    // Ordre et libellés de l'article 1 ; « Montant brut » et « Montant net à
+    // payer » mis en évidence (VI). Remboursements et déductions diverses :
+    // aucun élément de ce type n'est saisi dans Salareo, rubrique sans objet.
+    gainsClarifies(d).forEach(push)
+    push({ kind: 'bandFort', label: 'MONTANT BRUT', amt: d.totalBrut })
+    rubriques2027(d).forEach(push)
+    push({ kind: 'band', label: 'MONTANT NET SOCIAL', amt: d.netSocial })
+    push({ kind: 'band', label: 'MONTANT NET A PAYER AVANT IMPOT SUR LE REVENU', amt: d.netAvantIR })
+    push({ kind: 'sect', cols: P27_COLS('IMPOT SUR LE REVENU', 'Cumul annuel') })
+    push({ kind: 'ir', label: 'Montant net imposable', amt: d.baseIR, keep: true, cumul: cum.netImposable })
+    push({ kind: 'ir', label: 'Montant net des HC/ HS/ RTT exonérées', amt: d.montantNetHSExonere || 0, keep: true, cumul: cum.hsExonere || 0 })
+    push({ kind: 'ir', label: 'IMPÔT SUR LE REVENU PRÉLEVÉ À LA SOURCE', base: d.baseIR, taux: d.tauxIR, tauxKeep: true, amt: -(d.irPreleve || 0), keep: true, cumul: cum.irPreleve || 0 })
+    push({ kind: 'bandFort', label: 'MONTANT NET A PAYER (en Euros)', amt: d.netAPayer })
+    push({ kind: 'band', label: "TOTAL VERSÉ PAR L'EMPLOYEUR", amt: d.totalVerseEmployeur })
+  } else {
   gainsClarifies(d).forEach(push)
   push({ kind: 'blank' })
   push({ kind: 'total', label: 'Total Brut', amt: d.totalBrut })
@@ -2832,11 +3015,11 @@ export function layoutColonnes(data, employerInfo, employeeInfo, month, year) {
   push({ kind: 'band', label: 'Net à payer avant impôt', amt: d.netAvantIR })
   push({ kind: 'blank' })
   push({ kind: 'irhead' })
-  const cum = d.cumuls || {}
   push({ kind: 'ir', label: 'Montant net imposable', amt: d.baseIR, keep: true, cumul: cum.netImposable })
   push({ kind: 'ir', label: 'Montant net des heures compl/suppl exonérées', amt: d.montantNetHSExonere || 0, keep: true, cumul: cum.hsExonere || 0 })
   push({ kind: 'ir', label: `Impôt sur le revenu prélevé à la source (taux d'imposition ${d.irAuto === false ? 'personnalisé' : 'calculé selon barème'})`,
     base: d.baseIR, taux: d.tauxIR, tauxKeep: true, amt: -(d.irPreleve || 0), keep: true, cumul: cum.irPreleve || 0 })
+  }
 
   // ── Pas de ligne et corps : 34 lignes à 12,756 pt, resserrées au-delà ─────
   const pitch = rows.length > 0 ? Math.min(COL_PITCH, (COL_FIN - COL_TOP) / rows.length) : COL_PITCH
@@ -2855,10 +3038,10 @@ export function layoutColonnes(data, employerInfo, employeeInfo, month, year) {
   // Bandeaux gris (nets, en-tête impôt) et leurs filets
   const coupures = []
   rows.forEach((r, i) => {
-    if (r.kind !== 'band' && r.kind !== 'irhead') return
-    rect(COL_X[0], yTop(i), COL_X[6] - COL_X[0], pitch, COL_GRIS)
+    if (!['band', 'bandFort', 'irhead', 'sect'].includes(r.kind)) return
+    rect(COL_X[0], yTop(i), COL_X[6] - COL_X[0], pitch, r.kind === 'bandFort' ? COL_BLEU : COL_GRIS)
     line(COL_X[0], yTop(i), COL_X[6], yTop(i)); line(COL_X[0], yTop(i + 1), COL_X[6], yTop(i + 1))
-    if (r.kind === 'band') coupures.push([yTop(i), yTop(i + 1)])
+    if (r.kind === 'band' || r.kind === 'bandFort') coupures.push([yTop(i), yTop(i + 1)])
   })
   const fin = rows.length ? yTop(rows.length) : COL_FIN
   line(COL_X[0], fin, COL_X[6], fin)
@@ -2917,7 +3100,7 @@ export function layoutColonnes(data, employerInfo, employeeInfo, month, year) {
   }
 
   // ── Tableau ───────────────────────────────────────────────────────────────
-  ;[['Libellé', 0, 1], ['Base', 1, 2], ['Taux', 2, 3], ['Montant', 3, 4], ['Charges patronales', 4, 6]]
+  ;[['Libellé', 0, 1], ['Base', 1, 2], ['Taux', 2, 3], [m27 ? 'Salarié' : 'Montant', 3, 4], [m27 ? 'Employeur' : 'Charges patronales', 4, 6]]
     .forEach(([l, a, b]) => tx(l, (COL_X[a] + COL_X[b]) / 2, 248.74, 9, 'b', 'c', COL_BLANC))
 
   const cellules = (r, y) => {
@@ -2934,9 +3117,16 @@ export function layoutColonnes(data, employerInfo, employeeInfo, month, year) {
   rows.forEach((r, i) => {
     const y = yTop(i) + 9.284 * sc
     if (r.kind === 'blank') return
-    if (r.kind === 'band') {
-      tx(r.label, 23.28, yTop(i) + 10.13 * sc, fsBand, 'b')
-      tx(colNum(r.amt, 2, true), COL_R.mpat, yTop(i) + 10.13 * sc, fsBand, 'b', 'r')
+    if (r.kind === 'band' || r.kind === 'bandFort') {
+      const c = r.kind === 'bandFort' ? COL_BLANC : [0, 0, 0]
+      tx(r.label, 23.28, yTop(i) + 10.13 * sc, fsBand, 'b', 'l', c)
+      tx(colNum(r.amt, 2, true), COL_R.mpat, yTop(i) + 10.13 * sc, fsBand, 'b', 'r', c)
+      return
+    }
+    if (r.kind === 'sect') {
+      const yh = yTop(i) + 9.15 * sc
+      tx(encClip(r.cols[0], fs, COL_X[1] - COL_X[0] - 4, true), 23.28, yh, fs, 'b')
+      ;[[1, 1, 2], [2, 2, 3], [3, 3, 4], [4, 4, 6]].forEach(([k, a, b]) => tx(r.cols[k], (COL_X[a] + COL_X[b]) / 2, yh, fs, 'n', 'c'))
       return
     }
     if (r.kind === 'irhead') {
@@ -3071,11 +3261,16 @@ function traceOps(doc, ops) {
   })
 }
 
+/** Modèle de l'article 1 (obligatoire au 01/01/2027) : gabarit « colonnes », rubriques du texte. */
+export function layoutOfficiel2027(data, employerInfo, employeeInfo, month, year) {
+  return layoutColonnes(data, employerInfo, employeeInfo, month, year, { modele2027: true })
+}
+
 /** Trace `layoutColonnes` avec jsPDF (unité : point). */
 function buildColonnesDoc(JsPDF, data, employerInfo, employeeInfo, month, year, options = {}) {
   const doc = new JsPDF('p', 'pt', 'a4')
   patchTradText(doc)
-  traceOps(doc, layoutColonnes(data, employerInfo, employeeInfo, month, year).ops)
+  traceOps(doc, layoutColonnes(data, employerInfo, employeeInfo, month, year, { modele2027: !!options.modele2027 }).ops)
   // Filigrane d'aperçu non payé — même dispositif que les autres modèles. Inopérant sous Deno.
   if (options.watermark) {
     try { doc.setGState(new doc.GState({ opacity: 0.13 })) } catch { /* Deno : ignoré */ }
